@@ -1,6 +1,6 @@
 """Pydantic models for Producer Pal API."""
 
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -94,11 +94,21 @@ class Track(BaseModel):
         id: Track identifier.
         name: Track name.
         clips: List of clips on the track.
+        type: Track type ("midi" or "audio"). Optional.
+        trackIndex: Index of the track. Optional.
+        sessionClipCount: Number of clips in session view. Optional.
+        arrangementClipCount: Number of clips in arrangement view. Optional.
     """
 
     id: int
     name: str
-    clips: List[Clip]
+    clips: List[Clip] = []
+
+    # Дополнительные поля (опциональные)
+    type: Optional[str] = None  # "midi" или "audio"
+    trackIndex: Optional[int] = None
+    sessionClipCount: Optional[int] = None
+    arrangementClipCount: Optional[int] = None
 
 
 class ProjectInfo(BaseModel):

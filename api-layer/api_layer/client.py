@@ -24,6 +24,25 @@ class ProducerPalClient:
         """
         self.base_url = base_url.rstrip("/")
 
+    def _parse_sse(self, sse_text: str) -> dict:
+        """Parse Server-Sent Events format."""
+        import json
+
+        lines = sse_text.strip().split("\n")
+        for line in lines:
+            if line.startswith("data: "):
+                return json.loads(line[6:])
+        raise ValueError("No data in SSE response")
+
+    def _parse_js_object(self, js_text: str) -> dict:
+        """Convert JavaScript object notation to proper JSON."""
+        import json
+        import re
+
+        # Add quotes to unquoted keys: {id:"1"} → {"id":"1"}
+        json_text = re.sub(r"(\w+):", r'"\1":', js_text)
+        return json.loads(json_text)
+
     def _call_tool(self, tool_name: str, arguments: dict) -> dict:
         """Call a Producer Pal tool with given arguments.
 
@@ -37,25 +56,51 @@ class ProducerPalClient:
         Raises:
             ConnectionError: If connection to the API server fails.
             requests.RequestException: For other HTTP-related errors.
+            ValueError: If the JSON-RPC response contains an error object.
         """
         url = f"{self.base_url}/mcp"
         payload = {
+            "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
                 "name": tool_name,
                 "arguments": arguments,
             },
+            "id": 1,
         }
         
         try:
             response = requests.post(
                 url,
                 json=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                },
                 timeout=30,
             )
             response.raise_for_status()
-            return response.json()
+
+            # Layer 1: Parse SSE
+            if "text/event-stream" in response.headers.get("Content-Type", ""):
+                json_rpc_response = self._parse_sse(response.text)
+            else:
+                json_rpc_response = response.json()
+
+            # Check for error
+            if isinstance(json_rpc_response, dict) and json_rpc_response.get("error"):
+                raise ValueError(f"JSON-RPC error: {json_rpc_response['error']}")
+
+            # Layer 2: Extract MCP content
+            result = json_rpc_response.get("result", {}) if isinstance(json_rpc_response, dict) else {}
+            content = result.get("content", [])
+
+            if content and len(content) > 0 and content[0].get("type") == "text":
+                # Layer 3: Parse JS object
+                js_text = content[0].get("text", "{}")
+                return self._parse_js_object(js_text)
+
+            return result
         except RequestsConnectionError as e:
             raise ConnectionError(
                 f"Failed to connect to Producer Pal API at {self.base_url}: {e}"
@@ -92,9 +137,7 @@ class ProducerPalClient:
             requests.RequestException: For other HTTP-related errors.
             pydantic.ValidationError: If the response cannot be parsed into Track model.
         """
-        response = self._call_tool("ppal-read-track", {"trackId": track_id})
-        # Extract data from MCP response if needed
-        data = response.get("result", response) if isinstance(response, dict) else response
+        data = self._call_tool("ppal-read-track", {"trackId": track_id})
         return Track.model_validate(data)
 
     def create_midi_clip(self, track_id: int, notes: List[Note]) -> Clip:
@@ -118,9 +161,7 @@ class ProducerPalClient:
             "trackId": track_id,
             "notes": [note.model_dump() for note in notes],
         }
-        response = self._call_tool("ppal-create-clip", arguments)
-        # Extract data from MCP response if needed
-        data = response.get("result", response) if isinstance(response, dict) else response
+        data = self._call_tool("ppal-create-clip", arguments)
         return Clip.model_validate(data)
 
     def get_clip(self, track_id: int, clip_id: int) -> Clip:
@@ -140,9 +181,7 @@ class ProducerPalClient:
             requests.RequestException: For other HTTP-related errors.
             pydantic.ValidationError: If the response cannot be parsed into Clip model.
         """
-        response = self._call_tool(
+        data = self._call_tool(
             "ppal-read-clip", {"trackId": track_id, "clipId": clip_id}
         )
-        # Extract data from MCP response if needed
-        data = response.get("result", response) if isinstance(response, dict) else response
         return Clip.model_validate(data)
