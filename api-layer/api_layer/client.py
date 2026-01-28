@@ -13,6 +13,26 @@ class ProducerPalClient:
 
     This client provides methods to communicate with the Producer Pal service
     running on a specified base URL. It handles tool calls and error handling.
+    
+     TODO (Phase 3+): Consider migration to official MCP Python SDK
+    
+    Current implementation uses manual HTTP + parsing for simplicity and control.
+    When to migrate:
+    - Phase 3+ when multi-agent system requires advanced MCP features
+    - If Producer Pal fixes JavaScript object notation (unquoted keys)
+    - When we need to integrate with multiple MCP servers
+    
+    MCP SDK would handle:
+    - SSE parsing (Layer 1) ✓
+    - MCP content extraction (Layer 2) ✓
+    - But NOT JavaScript notation conversion (Layer 3) - still needed
+    
+    Migration effort: ~2-3 hours (convert to async API)
+    Benefit: Protocol updates, better error handling, community support
+    
+    References:
+    - MCP Python SDK: https://github.com/modelcontextprotocol/python-sdk
+    - Decision rationale: docs/ARCHITECTURE.md#why-manual-parsing
     """
 
     def __init__(self, base_url: str = "http://localhost:3350") -> None:
@@ -46,6 +66,10 @@ class ProducerPalClient:
     def _call_tool(self, tool_name: str, arguments: dict) -> dict:
         """Call a Producer Pal tool with given arguments.
 
+        NOTE: Manual 3-layer parsing (SSE → MCP → JS notation)
+        This could be replaced with MCP SDK in Phase 3+.
+        See class docstring for migration considerations.
+        
         Args:
             tool_name: Name of the tool to call (e.g., "ppal-read-live-set").
             arguments: Dictionary of arguments to pass to the tool.
