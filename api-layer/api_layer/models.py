@@ -25,33 +25,55 @@ class Note(BaseModel):
     @field_validator("start")
     @classmethod
     def validate_start_format(cls, v: str) -> str:
-        """Validate start format is 'bar|beat'."""
-        if "|" not in v:
-            raise ValueError('start must be in format "bar|beat" (e.g., "1|1")')
+        """Validate start is in format 'bar|beat' where both are numeric.
+
+        Examples: "1|1", "2|3", "1|2.998"
+        """
+        if not isinstance(v, str):
+            raise ValueError("start must be a string")
+
         parts = v.split("|")
         if len(parts) != 2:
-            raise ValueError('start must be in format "bar|beat" (e.g., "1|1")')
+            raise ValueError("start must be in format 'bar|beat'")
+
         try:
-            int(parts[0])
-            int(parts[1])
-        except ValueError:
-            raise ValueError('start must be in format "bar|beat" with numeric values')
+            bar = float(parts[0])
+            beat = float(parts[1])
+            if bar <= 0 or beat <= 0:
+                raise ValueError("bar and beat must be positive")
+        except ValueError as e:
+            if "must be positive" in str(e):
+                raise
+            raise ValueError("start must be in format 'bar|beat' with numeric values") from e
+
         return v
 
     @field_validator("duration")
     @classmethod
     def validate_duration_format(cls, v: str) -> str:
-        """Validate duration format is 'bars:beats'."""
+        """Validate duration is in format 'bars:beats' where both are numeric.
+
+        Examples: "1:0", "0:1", "1:0.5"
+        """
+        if not isinstance(v, str):
+            raise ValueError("duration must be a string")
+
         if ":" not in v:
             raise ValueError('duration must be in format "bars:beats" (e.g., "1:0")')
         parts = v.split(":")
         if len(parts) != 2:
             raise ValueError('duration must be in format "bars:beats" (e.g., "1:0")')
+
         try:
-            int(parts[0])
-            int(parts[1])
-        except ValueError:
-            raise ValueError('duration must be in format "bars:beats" with numeric values')
+            bars = float(parts[0])
+            beats = float(parts[1])
+            if bars < 0 or beats < 0:
+                raise ValueError("bars and beats must be non-negative")
+        except ValueError as e:
+            if "non-negative" in str(e):
+                raise
+            raise ValueError('duration must be in format "bars:beats" with numeric values') from e
+
         return v
 
 
