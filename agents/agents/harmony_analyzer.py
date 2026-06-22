@@ -1,6 +1,6 @@
 """Агент анализа гармонии в MIDI клипах."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -12,21 +12,24 @@ from .workflows.analyze_harmony import create_analysis_workflow
 class HarmonyAnalysis(BaseModel):
     """Результат гармонического анализа клипа."""
 
-    key: str  # Например: "C major", "A minor"
-    confidence: float  # 0.0 - 1.0
-    chords: list[str]  # Список аккордов: ["Cmaj", "Fmaj", "G7"]
-    scale_notes: list[str]  # Ноты гаммы: ["C", "D", "E", "F", "G", "A", "B"]
-    reasoning: str  # Объяснение от Claude
-    raw_notes: list[dict[str, Any]]  # Исходные ноты из клипа
+    key: str
+    key_confidence: float
+    key_alternate_gap: float
+    confidence: float  # alias key_confidence для обратной совместимости
+    tonal_mode: Literal["functional", "modal", "ambiguous"]
+    tonal_mode_reason: str
+    chords: list[str]
+    scale_notes: list[str]
+    reasoning: str
+    raw_notes: list[dict[str, Any]]
+    chord_events: list[dict[str, Any]]
 
 
 class HarmonyAnalyzer:
     """Агент для анализа гармонии в MIDI клипах.
 
-    Использует Claude API + music theory skills для:
-    - Определения тональности
-    - Распознавания аккордов
-    - Анализа гармонических прогрессий
+    Детерминированная разметка (тональность, ступени, T-S-D) — music21.
+    Claude — только reasoning/интерпретация поверх готовых полей.
     """
 
     def __init__(self, client: ProducerPalClient, api_key: str) -> None:
@@ -61,8 +64,11 @@ class HarmonyAnalyzer:
             "track_index": track_index,
             "scene_index": scene_index,
             "clip": None,
+            "time_signature": None,
             "skill_content": None,
+            "functional_harmony": None,
             "claude_response": None,
+            "chord_events": None,
             "analysis_result": None,
             "error": None,
         }

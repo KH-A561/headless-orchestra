@@ -1,60 +1,20 @@
 """LangGraph workflow для гармонического анализа."""
 
 import json
-import re
-from collections import defaultdict
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
-from anthropic import Anthropic
 
 from api_layer.client import ProducerPalClient
 from api_layer.models import Clip
 
-# MIDI: C4=60, A4=69. Ноты в октаве: C=0, C#/Db=1, D=2, ..., B=11
-_PITCH_TO_SEMITONE: dict[str, int] = {
-    "C": 0,
-    "C#": 1,
-    "DB": 1,
-    "D": 2,
-    "D#": 3,
-    "EB": 3,
-    "E": 4,
-    "F": 5,
-    "F#": 6,
-    "GB": 6,
-    "G": 7,
-    "G#": 8,
-    "AB": 8,
-    "A": 9,
-    "A#": 10,
-    "BB": 10,
-    "B": 11,
-}
-
-
-def pitch_to_midi(pitch: str) -> int:
-    """Конвертирует строку pitch (например 'C3', 'F#4', 'Bb2') в MIDI номер.
-    C4 = 60, A4 = 69.
-    """
-    pitch = pitch.strip().upper()
-    if not pitch:
-        raise ValueError("Empty pitch string")
-    # Отделяем буквенную часть от октавы (цифры в конце, возможно с минусом)
-    match = re.match(r"^([A-G][#B]?)(-?\d+)$", pitch)
-    if not match:
-        raise ValueError(f"Invalid pitch format: {pitch}")
-    note_part, octave_part = match.group(1), match.group(2)
-    # Bb -> BB для словаря
-    if len(note_part) == 2 and note_part[1] == "B":
-        note_part = f"{note_part[0]}B"
-    if note_part not in _PITCH_TO_SEMITONE:
-        raise ValueError(f"Unknown note name: {note_part}")
-    octave = int(octave_part)
-    semitone = _PITCH_TO_SEMITONE[note_part]
-    # MIDI: (octave + 1) * 12 + semitone => C4 = 5*12+0 = 60
-    return (octave + 1) * 12 + semitone
+from ..chord_grouping import parse_time_signature
+from ..harmony_pipeline import (
+    DeterministicHarmonyAnalysis,
+    fetch_claude_harmony_reasoning,
+    run_deterministic_harmony_analysis,
+)
 
 
 class AnalysisState(TypedDict):
@@ -63,8 +23,11 @@ class AnalysisState(TypedDict):
     track_index: int
     scene_index: int
     clip: Clip | None
+    time_signature: str | None
     skill_content: str | None
+    functional_harmony: dict[str, Any] | None
     claude_response: dict | None
+    chord_events: list[dict[str, Any]] | None
     analysis_result: dict | None
     error: str | None
 
@@ -76,19 +39,19 @@ def create_analysis_workflow(
     """Создает LangGraph workflow для анализа гармонии.
 
     Workflow structure:
-    START → fetch_clip → load_skill → analyze_with_claude → format_result → END
-
-    Args:
-        client: ProducerPalClient для доступа к Ableton
-        api_key: Anthropic API key
-
-    Returns:
-        Configured StateGraph ready to compile
+    START → fetch_clip → load_skill → deterministic_analysis
+          → analyze_with_claude → format_result → END
     """
 
     def fetch_clip(state: AnalysisState) -> AnalysisState:
         """Node 1: Получить клип из Ableton по trackIndex и sceneIndex."""
         try:
+            project = client.get_project_info()
+            time_signature = (
+                project.get("timeSignature")
+                or project.get("time_signature")
+                or ""
+            )
             clip = client.get_clip(
                 state["track_index"],
                 clip_id=None,
@@ -96,7 +59,12 @@ def create_analysis_workflow(
             )
             if not clip.notes:
                 return {**state, "error": "Clip contains no notes"}
-            return {**state, "clip": clip, "error": None}
+            return {
+                **state,
+                "clip": clip,
+                "time_signature": time_signature,
+                "error": None,
+            }
         except Exception as e:
             return {**state, "error": f"Failed to fetch clip: {e}"}
 
@@ -112,101 +80,93 @@ def create_analysis_workflow(
         except Exception as e:
             return {**state, "error": f"Failed to load skill: {e}"}
 
-    def analyze_with_claude(state: AnalysisState) -> AnalysisState:
-        """Node 3: Анализ через Claude API."""
+    def deterministic_analysis(state: AnalysisState) -> AnalysisState:
+        """Node 3: Группировка + детерминированная разметка (music21)."""
         if state.get("error"):
             return state
 
         clip = state.get("clip")
-        skill_content = state.get("skill_content") or ""
-
         if not clip or not clip.notes:
             return {**state, "error": "No clip or notes to analyze"}
 
         try:
-            # 2. Сгруппировать ноты по start (времени)
-            notes_by_time: dict[str, list[str]] = defaultdict(list)
-            for note in clip.notes:
-                notes_by_time[note.start].append(note.pitch)
+            beats_per_bar = parse_time_signature(state.get("time_signature") or "")
+            result = run_deterministic_harmony_analysis(clip.notes, beats_per_bar)
 
-            # Преобразовать в список временных точек с MIDI pitch
-            chord_progression: list[dict] = []
-            sort_key = lambda s: tuple(float(x) for x in s.split("|"))
-            for start_time in sorted(notes_by_time.keys(), key=sort_key):
-                pitches = notes_by_time[start_time]
-                midi_pitches = []
-                for p in pitches:
-                    try:
-                        midi_pitches.append(pitch_to_midi(p))
-                    except ValueError as e:
-                        print(f"Warning: skip invalid pitch {p}: {e}")
-                if midi_pitches:
-                    chord_progression.append({
-                        "time": start_time,
-                        "pitches": sorted(midi_pitches),
-                    })
-            if not chord_progression:
-                return {**state, "error": "No valid pitches extracted from clip notes"}
-
-            print(f"Extracted chord progression: {len(chord_progression)} time points")
-
-            # 3. Подготовить prompt для Claude
-            system_message = (
-                "You are a music theory expert. Analyze the harmony using the provided skill knowledge."
-            )
-            user_message = (
-                f"{skill_content}\n\n"
-                "Analyze this chord progression:\n"
-            )
-            for chord in chord_progression:
-                user_message += f"  At {chord['time']}: {chord['pitches']}\n"
-            user_message += (
-                "\nReturn a single JSON object with:\n"
-                '"key", "confidence", "chords" (list of chord symbols with timing, e.g. "Cmaj @ 1|1"), '
-                '"scale_notes", "reasoning".'
+            print(
+                f"Deterministic analysis: key={result.key}, "
+                f"mode={result.tonal_mode}, chords={len(result.chord_events)}"
             )
 
-            # 4. Вызвать Anthropic API
-            print("Calling Claude API...")
-            anthropic_client = Anthropic(api_key=api_key)
-            response = anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=2000,
-                temperature=0,
-                system=system_message,
-                messages=[{"role": "user", "content": user_message}],
-            )
-
-            # 5. Распарсить ответ
-            if not response.content or not hasattr(response.content[0], "text"):
-                return {
-                    **state,
-                    "error": "Empty or invalid response from Claude API",
-                }
-            text = response.content[0].text
-
-            # Убрать markdown-обертку ```json ... ``` если есть
-            json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
-            if json_match:
-                text = json_match.group(1).strip()
-            else:
-                text = text.strip()
-
-            result = json.loads(text)
-
-            # Проверка ожидаемой структуры
-            required_keys = {"key", "confidence", "chords", "scale_notes", "reasoning"}
-            if not required_keys.issubset(result.keys()):
-                missing = required_keys - result.keys()
-                return {
-                    **state,
-                    "error": f"Claude response missing keys: {missing}",
-                }
-
-            print("Claude analysis successful.")
             return {
                 **state,
-                "claude_response": result,
+                "functional_harmony": {
+                    "key": result.key,
+                    "key_confidence": result.key_confidence,
+                    "key_alternate_gap": result.key_alternate_gap,
+                    "tonal_mode": result.tonal_mode,
+                    "tonal_mode_reason": result.tonal_mode_reason,
+                    "scale_notes": result.scale_notes,
+                    "chords": result.chords,
+                },
+                "chord_events": result.chord_events,
+                "error": None,
+            }
+        except ValueError as e:
+            return {**state, "error": str(e)}
+        except Exception as e:
+            return {**state, "error": f"Deterministic analysis failed: {e}"}
+
+    def analyze_with_claude(state: AnalysisState) -> AnalysisState:
+        """Node 4: Claude — только reasoning поверх готовой разметки."""
+        if state.get("error"):
+            return state
+
+        skill_content = state.get("skill_content") or ""
+        functional = state.get("functional_harmony")
+        chord_events = state.get("chord_events") or []
+
+        if not functional:
+            return {**state, "error": "Missing functional_harmony from deterministic step"}
+
+        try:
+            clip = state.get("clip")
+            raw_notes = []
+            if clip and clip.notes:
+                raw_notes = [
+                    {
+                        "pitch": n.pitch,
+                        "start": n.start,
+                        "duration": n.duration,
+                        "velocity": n.velocity,
+                    }
+                    for n in clip.notes
+                ]
+
+            deterministic = DeterministicHarmonyAnalysis(
+                key=functional["key"],
+                key_confidence=functional["key_confidence"],
+                key_alternate_gap=functional["key_alternate_gap"],
+                confidence=functional["key_confidence"],
+                tonal_mode=functional["tonal_mode"],
+                tonal_mode_reason=functional["tonal_mode_reason"],
+                chords=functional["chords"],
+                scale_notes=functional["scale_notes"],
+                raw_notes=raw_notes,
+                chord_events=chord_events,
+            )
+
+            print("Calling Claude API for reasoning...")
+            reasoning = fetch_claude_harmony_reasoning(
+                deterministic,
+                api_key,
+                skill_content=skill_content,
+            )
+
+            print("Claude reasoning successful.")
+            return {
+                **state,
+                "claude_response": {"reasoning": reasoning},
                 "error": None,
             }
 
@@ -224,56 +184,60 @@ def create_analysis_workflow(
             }
 
     def format_result(state: AnalysisState) -> AnalysisState:
-        """Node 4: Форматировать результат в HarmonyAnalysis."""
+        """Node 5: Собрать HarmonyAnalysis из deterministic + Claude reasoning."""
         if state.get("error"):
             return state
 
+        functional = state.get("functional_harmony")
         claude_response = state.get("claude_response")
         clip = state.get("clip")
 
-        required_keys = {"key", "confidence", "chords", "scale_notes", "reasoning"}
-        if not claude_response or not isinstance(claude_response, dict):
+        if not functional:
+            return {**state, "error": "Missing functional_harmony"}
+        if not claude_response or "reasoning" not in claude_response:
             return {**state, "error": "Missing or invalid claude_response"}
-        if not required_keys.issubset(claude_response.keys()):
-            missing = required_keys - claude_response.keys()
-            return {**state, "error": f"claude_response missing keys: {missing}"}
         if not clip or not clip.notes:
             return {**state, "error": "Missing clip or notes for raw_notes"}
 
         raw_notes = [
             {
-                "pitch": note.pitch,
-                "start": note.start,
-                "duration": note.duration,
-                "velocity": note.velocity,
+                "pitch": note_obj.pitch,
+                "start": note_obj.start,
+                "duration": note_obj.duration,
+                "velocity": note_obj.velocity,
             }
-            for note in clip.notes
+            for note_obj in clip.notes
         ]
 
+        key_confidence = functional["key_confidence"]
         analysis_result = {
-            "key": claude_response["key"],
-            "confidence": claude_response["confidence"],
-            "chords": claude_response["chords"],
-            "scale_notes": claude_response["scale_notes"],
+            "key": functional["key"],
+            "key_confidence": key_confidence,
+            "key_alternate_gap": functional["key_alternate_gap"],
+            "confidence": key_confidence,
+            "tonal_mode": functional["tonal_mode"],
+            "tonal_mode_reason": functional["tonal_mode_reason"],
+            "chords": functional["chords"],
+            "scale_notes": functional["scale_notes"],
             "reasoning": claude_response["reasoning"],
             "raw_notes": raw_notes,
+            "chord_events": state.get("chord_events") or [],
         }
 
         return {**state, "analysis_result": analysis_result}
 
-    # Создаем граф
     workflow = StateGraph(AnalysisState)
 
-    # Добавляем узлы
     workflow.add_node("fetch_clip", fetch_clip)
     workflow.add_node("load_skill", load_skill)
+    workflow.add_node("deterministic_analysis", deterministic_analysis)
     workflow.add_node("analyze_with_claude", analyze_with_claude)
     workflow.add_node("format_result", format_result)
 
-    # Определяем edges
     workflow.set_entry_point("fetch_clip")
     workflow.add_edge("fetch_clip", "load_skill")
-    workflow.add_edge("load_skill", "analyze_with_claude")
+    workflow.add_edge("load_skill", "deterministic_analysis")
+    workflow.add_edge("deterministic_analysis", "analyze_with_claude")
     workflow.add_edge("analyze_with_claude", "format_result")
     workflow.add_edge("format_result", END)
 
