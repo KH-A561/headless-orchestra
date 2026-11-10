@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Оффлайн-харнесс: загрузка .mid и детерминированный гармонический анализ.
+"""Оффлайн-харнесс: загрузка .mid и детерминированный анализ (гармония / ритм).
 
 Запуск из каталога agents:
     poetry run python scripts/analyze_midi_file.py FILE.mid [--track N] [--with-llm] [--json]
+        [--analysis {harmony,rhythm,both}] [--clip-bars N] [--material ...] [--lane-names PATH]
 
 Gotchas:
 - Note-on читаются через mido (сырые тики), НЕ converter.parse — music21 дублирует на сетку.
@@ -33,9 +34,11 @@ from agents.harmony_pipeline import (
     fetch_claude_harmony_reasoning,
     run_deterministic_harmony_analysis,
 )
-
-# Sharp-default pitch-class names (Ableton convention).
-_PC_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+from agents.midi_utils import midi_to_ableton_pitch
+from agents.rhythm_analyzer import (
+    DeterministicRhythmAnalysis,
+    run_deterministic_rhythm_analysis,
+)
 
 # GM drum channel (1-based channel 10 → 0-based index 9).
 _DRUM_CHANNEL = 9
@@ -51,16 +54,8 @@ class MidiLoadResult:
     beats_per_bar: int
     time_signature_str: str
     warnings: list[str]
-
-
-def midi_to_ableton_pitch(midi: int) -> str:
-    """MIDI номер → строка pitch в конвенции Ableton (C3 = MIDI 60).
-
-    Ableton C3 = music21 C4 = MIDI 60.
-    """
-    pc = midi % 12
-    octave = midi // 12 - 2
-    return f"{_PC_NAMES[pc]}{octave}"
+    tempo_bpm: float | None = None
+    track_name: str | None = None
 
 
 def _extract_time_signature_mido(mid: mido.MidiFile) -> tuple[int, str, list[str]]:
@@ -86,6 +81,23 @@ def _extract_time_signature_mido(mid: mido.MidiFile) -> tuple[int, str, list[str
                 return beats_per_bar, ts_str, warnings
 
     return beats_per_bar, ts_str, warnings
+
+
+def _extract_tempo_and_track_name(
+    mid: mido.MidiFile,
+) -> tuple[float | None, str | None]:
+    """Первое set_tempo (в BPM) и первый непустой track_name по всем трекам."""
+    tempo_bpm: float | None = None
+    track_name: str | None = None
+    for track in mid.tracks:
+        for msg in track:
+            if tempo_bpm is None and msg.type == "set_tempo":
+                tempo_bpm = mido.tempo2bpm(msg.tempo)
+            if track_name is None and msg.type == "track_name" and msg.name:
+                track_name = msg.name
+        if tempo_bpm is not None and track_name is not None:
+            break
+    return tempo_bpm, track_name
 
 
 def _track_has_note_on(track: mido.MidiTrack) -> bool:
@@ -119,10 +131,12 @@ def _load_raw_note_ons_mido(
     mid: mido.MidiFile,
     *,
     track: int | None = None,
+    skip_drum_channel: bool | None = None,
 ) -> list[tuple[float, int, int, int]]:
     """Сырые note-on: (offset_quarters, midi_pitch, velocity, channel)."""
     ticks_per_beat = mid.ticks_per_beat
-    skip_drum_channel = track is None
+    if skip_drum_channel is None:
+        skip_drum_channel = track is None
 
     note_track_indices = [i for i, tr in enumerate(mid.tracks) if _track_has_note_on(tr)]
     if not note_track_indices:
@@ -155,11 +169,19 @@ def load_midi_notes(
     path: Path,
     *,
     track: int | None = None,
+    skip_drum_channel: bool | None = None,
 ) -> MidiLoadResult:
-    """Загрузить MIDI через mido и конвертировать ноты во внутренний формат Note."""
+    """Загрузить MIDI через mido и конвертировать ноты во внутренний формат Note.
+
+    ``skip_drum_channel=None`` сохраняет текущее поведение (ударный канал
+    пропускается при слиянии всех партий); ``False`` — ударные не выкидывать.
+    """
     mid = mido.MidiFile(str(path))
     beats_per_bar, ts_str, warnings = _extract_time_signature_mido(mid)
-    raw_events = _load_raw_note_ons_mido(mid, track=track)
+    tempo_bpm, track_name = _extract_tempo_and_track_name(mid)
+    raw_events = _load_raw_note_ons_mido(
+        mid, track=track, skip_drum_channel=skip_drum_channel
+    )
 
     notes: list[Note] = []
     for offset, midi, velocity, _channel in raw_events:
@@ -180,6 +202,8 @@ def load_midi_notes(
         beats_per_bar=beats_per_bar,
         time_signature_str=ts_str,
         warnings=warnings,
+        tempo_bpm=tempo_bpm,
+        track_name=track_name,
     )
 
 
@@ -236,55 +260,205 @@ def _print_report(
     print("=" * 72)
 
 
+def _load_lane_names(path: Path) -> dict[int, str]:
+    """Читает JSON-маппинг лейнов ``{"36": "bass chop"}`` → ``{36: "bass chop"}``."""
+    if not path.is_file():
+        raise ValueError(f"Lane names file not found: {path}")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in lane names file {path}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"Lane names file {path} must contain a JSON object, e.g. "
+            '{"36": "bass chop"}'
+        )
+
+    lane_names: dict[int, str] = {}
+    for key, value in raw.items():
+        try:
+            pitch = int(key)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid pitch key {key!r} in lane names file {path}: "
+                "keys must be MIDI note numbers"
+            ) from None
+        if not isinstance(value, str):
+            raise ValueError(
+                f"Invalid label for pitch {key!r} in lane names file {path}: "
+                "values must be strings"
+            )
+        lane_names[pitch] = value
+    return lane_names
+
+
+def _print_rhythm_report(
+    path: Path,
+    load_result: MidiLoadResult,
+    result: DeterministicRhythmAnalysis,
+) -> None:
+    print("=" * 72)
+    print("RHYTHM ANALYSIS (offline MIDI)")
+    print("=" * 72)
+    print(f"File:           {path}")
+    if load_result.tempo_bpm is not None:
+        print(f"Tempo:          {load_result.tempo_bpm:.1f} BPM")
+    else:
+        print("Tempo:          unknown (no tempo meta)")
+    if load_result.track_name:
+        print(f"Track:          {load_result.track_name}")
+    print(f"Time signature: {load_result.time_signature_str}")
+    num_bars = result.clip_length_beats / result.beats_per_bar
+    print(
+        f"Clip length:    {result.clip_length_beats:g} beats "
+        f"({num_bars:g} bars, inferred={result.clip_length_inferred})"
+    )
+    routing = result.routing
+    print(
+        f"Routing:        {routing.material} ({routing.source}; "
+        f"monophonic={routing.monophonic_ratio:.3f}, "
+        f"distinct_pitches={routing.distinct_pitches}, "
+        f"chromatic_neighbors={routing.chromatic_neighbor_ratio:.3f})"
+    )
+    print()
+
+    header = (
+        f"{'lane':>4}  {'name':<5}  {'label':<14}  {'count':>5}  "
+        f"{'int_mean':>8}  {'cv':>6}  {'dev_mean':>8}  {'dev_std':>8}  "
+        f"{'vel(min-max)':>12}"
+    )
+    print(header)
+    print("-" * len(header))
+    for lane in result.lanes:
+        name = lane.pitch_name or "—"
+        label = lane.label or "—"
+        int_mean_str = f"{lane.interval_mean:.3f}" if lane.interval_mean is not None else "—"
+        cv_str = f"{lane.interval_cv:.3f}" if lane.interval_cv is not None else "—"
+        print(
+            f"{lane.lane_id:>4}  {name:<5}  {label:<14}  {lane.count:>5}  "
+            f"{int_mean_str:>8}  {cv_str:>6}  {lane.timing.dev_mean:>+8.3f}  "
+            f"{lane.timing.dev_std:>8.3f}  "
+            f"{lane.velocity.min}-{lane.velocity.max:>11}"
+        )
+
+    print()
+    print("Hits per bar:")
+    for lane in result.lanes:
+        print(f"  {lane.lane_id:>4}: {lane.hits_per_bar}")
+
+    print()
+    print("Observations:")
+    for obs in result.observations:
+        lane = f"lane {obs.lane_id}" if obs.lane_id else "clip"
+        print(
+            f"  {obs.code:<16} ({lane}, confidence={obs.confidence:.2f}): {obs.text}"
+        )
+    print("=" * 72)
+
+
 def analyze_midi_file(
     path: Path,
     *,
     track: int | None = None,
     with_llm: bool = False,
     emit_json: bool = False,
-) -> tuple[DeterministicHarmonyAnalysis, str | None]:
-    """Полный прогон: загрузка → анализ → опционально LLM reasoning."""
-    load_result = load_midi_notes(path, track=track)
+    analysis: str = "harmony",
+    clip_bars: int | None = None,
+    material: str = "auto",
+    lane_names: dict[int, str] | None = None,
+) -> tuple[DeterministicHarmonyAnalysis | DeterministicRhythmAnalysis, str | None]:
+    """Полный прогон: загрузка → анализ (гармония и/или ритм).
 
-    for warning in load_result.warnings:
-        print(f"Warning: {warning}", file=sys.stderr)
+    ``analysis``: "harmony" | "rhythm" | "both". В режиме "both" файл грузится
+    дважды: гармония получает ноты как в режиме "harmony" (skip_drum_channel=None),
+    ритм — с skip_drum_channel=False. ``with_llm`` допустим только в режиме "harmony".
+    """
+    if with_llm and analysis != "harmony":
+        raise ValueError("--with-llm is only supported with --analysis harmony")
 
-    result = run_deterministic_harmony_analysis(
-        load_result.notes,
-        load_result.beats_per_bar,
-    )
+    harmony_load: MidiLoadResult | None = None
+    rhythm_load: MidiLoadResult | None = None
 
+    if analysis in ("harmony", "both"):
+        harmony_load = load_midi_notes(path, track=track, skip_drum_channel=None)
+    if analysis in ("rhythm", "both"):
+        rhythm_load = load_midi_notes(path, track=track, skip_drum_channel=False)
+
+    seen_warnings: set[str] = set()
+    for load in (harmony_load, rhythm_load):
+        if load is None:
+            continue
+        for warning in load.warnings:
+            if warning not in seen_warnings:
+                print(f"Warning: {warning}", file=sys.stderr)
+                seen_warnings.add(warning)
+
+    harmony_result: DeterministicHarmonyAnalysis | None = None
+    rhythm_result: DeterministicRhythmAnalysis | None = None
     reasoning: str | None = None
-    if with_llm:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            print(
-                "ERROR: --with-llm requires ANTHROPIC_API_KEY environment variable.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        print("Calling Claude API for reasoning...", file=sys.stderr)
-        reasoning = fetch_claude_harmony_reasoning(result, api_key)
-        print()
-        print("REASONING")
-        print("-" * 40)
-        print(reasoning)
-        print()
 
-    _print_report(path, load_result, result)
+    if harmony_load is not None:
+        harmony_result = run_deterministic_harmony_analysis(
+            harmony_load.notes,
+            harmony_load.beats_per_bar,
+        )
+        if with_llm:
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                print(
+                    "ERROR: --with-llm requires ANTHROPIC_API_KEY environment variable.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print("Calling Claude API for reasoning...", file=sys.stderr)
+            reasoning = fetch_claude_harmony_reasoning(harmony_result, api_key)
+            print()
+            print("REASONING")
+            print("-" * 40)
+            print(reasoning)
+            print()
+        _print_report(path, harmony_load, harmony_result)
+
+    if rhythm_load is not None:
+        clip_length_beats = None
+        if clip_bars is not None:
+            clip_length_beats = clip_bars * rhythm_load.beats_per_bar
+        rhythm_result = run_deterministic_rhythm_analysis(
+            rhythm_load.notes,
+            rhythm_load.beats_per_bar,
+            clip_length_beats=clip_length_beats,
+            material=material,  # type: ignore[arg-type]
+            lane_names=lane_names,
+        )
+        _print_rhythm_report(path, rhythm_load, rhythm_result)
 
     if emit_json:
-        payload: dict[str, Any] = result.model_dump()
-        if reasoning is not None:
-            payload["reasoning"] = reasoning
+        if analysis == "rhythm":
+            assert rhythm_result is not None
+            payload: dict[str, Any] = rhythm_result.model_dump()
+        elif analysis == "both":
+            assert harmony_result is not None and rhythm_result is not None
+            payload = {
+                "harmony": harmony_result.model_dump(),
+                "rhythm": rhythm_result.model_dump(),
+            }
+        else:
+            assert harmony_result is not None
+            payload = harmony_result.model_dump()
+            if reasoning is not None:
+                payload["reasoning"] = reasoning
         print(json.dumps(payload, indent=2, ensure_ascii=False))
 
-    return result, reasoning
+    primary = rhythm_result if analysis == "rhythm" else harmony_result
+    assert primary is not None
+    return primary, reasoning
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Offline MIDI harmony analysis (deterministic pipeline)."
+        description="Offline MIDI analysis (deterministic pipeline: harmony/rhythm)."
     )
     parser.add_argument("midi_file", type=Path, help="Path to .mid file")
     parser.add_argument(
@@ -294,9 +468,33 @@ def main(argv: list[str] | None = None) -> None:
         help="Restrict to one note-bearing track by 0-based index (default: merge all)",
     )
     parser.add_argument(
+        "--analysis",
+        choices=["harmony", "rhythm", "both"],
+        default="harmony",
+        help="Which deterministic analysis to run (default: harmony)",
+    )
+    parser.add_argument(
+        "--clip-bars",
+        type=int,
+        default=None,
+        help="Clip length in bars for rhythm analysis (clip_length_beats = N * beats_per_bar)",
+    )
+    parser.add_argument(
+        "--material",
+        choices=["auto", "percussion", "pitched"],
+        default="auto",
+        help="Material routing for rhythm analysis (default: auto)",
+    )
+    parser.add_argument(
+        "--lane-names",
+        type=Path,
+        default=None,
+        help='JSON file mapping MIDI pitches to labels, e.g. {"36": "bass chop"}',
+    )
+    parser.add_argument(
         "--with-llm",
         action="store_true",
-        help="Run Claude reasoning on top of deterministic result (requires API key)",
+        help="Run Claude reasoning on top of deterministic harmony result (requires API key)",
     )
     parser.add_argument(
         "--json",
@@ -309,12 +507,31 @@ def main(argv: list[str] | None = None) -> None:
         print(f"ERROR: File not found: {args.midi_file}", file=sys.stderr)
         sys.exit(1)
 
+    if args.clip_bars is not None and args.clip_bars <= 0:
+        print("ERROR: --clip-bars must be a positive integer", file=sys.stderr)
+        sys.exit(1)
+
+    if args.with_llm and args.analysis != "harmony":
+        print(
+            "ERROR: --with-llm is only supported with --analysis harmony",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     try:
+        lane_names = None
+        if args.lane_names is not None:
+            lane_names = _load_lane_names(args.lane_names)
+
         analyze_midi_file(
             args.midi_file,
             track=args.track,
             with_llm=args.with_llm,
             emit_json=args.json,
+            analysis=args.analysis,
+            clip_bars=args.clip_bars,
+            material=args.material,
+            lane_names=lane_names,
         )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
