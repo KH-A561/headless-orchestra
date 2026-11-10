@@ -1,252 +1,103 @@
 # Headless Orchestra
 
-AI-powered music production agents for Ableton Live with deep musical intelligence.
+Music analysis assistant for Ableton Live: a deterministic "music linter" plus an LLM explainer.
 
-[![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Poetry](https://img.shields.io/badge/poetry-1.8+-purple.svg)](https://python-poetry.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+## Principle
 
-## 🎯 Vision
+- **The deterministic layer (music21 / mido) computes the facts and owns all classification**:
+  chord events, key, roman numerals, T-S-D functions, tonal-mode gating.
+- **Claude only reasons and explains** on top of those computed facts. It never classifies on its own.
+- **Analysis is descriptive, not prescriptive.** For ambiguous or modal material, functions are
+  *suppressed rather than guessed*. Intentional strangeness is flagged, not "fixed".
 
-Headless Orchestra is an AI agent platform that brings **musical intelligence** to DAW automation. Unlike existing MCP servers that only execute commands, Headless Orchestra provides:
+See [docs/VISION.md](docs/VISION.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-- 🎼 **Deep music analysis** — harmony, rhythm, orchestration understanding
-- 🤖 **Multi-agent orchestration** — specialized agents working together
-- 🎵 **Music theory knowledge** — contextual corrections based on music principles
-- 🔊 **Audio analysis** — spectral, timbral, and structural analysis
-- 🔄 **DAW-agnostic design** — abstraction layer for future multi-DAW support
+## Status (November 2026)
 
-**Current Focus:** Ableton Live via Producer Pal MCP bridge
+| Component | State |
+|---|---|
+| `api-layer` — Producer Pal client (MCP over HTTP :3350), Pydantic models | ✅ unit-tested with mocks; ⚠️ live Ableton integration not verified |
+| Chord grouping — tolerant onset clustering, time-signature aware, anticipation flag | ✅ |
+| Functional harmony Level 2 (slices A+B) — Krumhansl-Schmuckler key, roman numerals, T-S-D, `detect_tonal_mode` gating, incomplete chords | ✅ |
+| Shared pipeline `run_deterministic_harmony_analysis` — used by the LangGraph workflow and the offline harness | ✅ |
+| RhythmAnalyzer | 📝 design only — [docs/rhythm_analyzer_notes.md](docs/rhythm_analyzer_notes.md) |
+| Harmony slice C (cadences, local key, secondary dominants, borrowed chords) | ⏳ planned |
+| TimbreAnalyzer, swappable reasoning provider | ⏳ planned |
 
-See [docs/VISION.md](docs/VISION.md) for full project vision.
+Open decision: stay on Producer Pal or move to the Ableton Extensions SDK
+(beta, local copy in `docs/ableton-extensions-sdk/`).
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│   Headless AI Agents (LangGraph)        │
-│   ├─ HarmonyAnalyzer (planned)          │
-│   ├─ RhythmAnalyzer (planned)           │
-│   └─ OrchestrationAgent (planned)       │
-└─────────────────────────────────────────┘
-            ↓ Normalized API
-┌─────────────────────────────────────────┐
-│   API Abstraction Layer (✅ READY)      │
-│   - ProducerPalClient                   │
-│   - Pydantic models with validation     │
-│   - Type-safe interface                 │
-└─────────────────────────────────────────┘
-            ↓ HTTP (MCP protocol)
-┌─────────────────────────────────────────┐
-│   Producer Pal (MCP Bridge)             │
-│   - Max for Live device                 │
-│   - HTTP server on port 3350            │
-└─────────────────────────────────────────┘
-            ↓ Max Messages
-┌─────────────────────────────────────────┐
-│   Ableton Live                          │
-└─────────────────────────────────────────┘
+LangGraph workflow (agents/agents/workflows/analyze_harmony.py)
+  fetch_clip → load_skill → deterministic_analysis → analyze_with_claude → format_result
+        │                          │
+        │                          └─ harmony_pipeline.py  (chord_grouping + functional_labeling)
+        ▼
+api-layer: ProducerPalClient ──HTTP/MCP──► Producer Pal (Max for Live, :3350) ──► Ableton Live
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture documentation.
+The offline harness (`agents/scripts/analyze_midi_file.py`) runs the same deterministic pipeline
+on a `.mid` file without Ableton.
 
-## 📦 Project Structure
+## Project structure
 
 ```
 headless-orchestra/
-├── api-layer/              # API Abstraction Layer (✅ READY)
-│   ├── api_layer/
-│   │   ├── client.py      # ProducerPalClient
-│   │   └── models.py      # Pydantic models
-│   └── tests/             # Unit tests (pytest + mocking)
-│
-├── agents/                 # AI Agents (planned)
+├── api-layer/                  # Producer Pal client
+│   ├── api_layer/client.py     # ProducerPalClient
+│   ├── api_layer/models.py     # Pydantic models (Note, Clip, Track)
+│   └── tests/                  # pytest, mocked HTTP
+├── agents/
 │   ├── agents/
-│   │   └── skills/        # Music theory knowledge base
-│   └── tests/
-│
-├── shared/                 # Common utilities
-│   └── shared/
-│
-├── docs/                   # Documentation
-│   ├── ARCHITECTURE.md    # Architecture details
-│   ├── VISION.md          # Project vision & goals
-│   └── producer-pal/      # Producer Pal API reference
-│
-└── .cursor/               # Cursor IDE rules
-    └── rules.md
+│   │   ├── chord_grouping.py       # onset clustering, anticipation
+│   │   ├── functional_labeling.py  # key, roman numerals, T-S-D, tonal mode
+│   │   ├── harmony_pipeline.py     # deterministic pipeline + Claude reasoning call
+│   │   ├── harmony_analyzer.py     # HarmonyAnalyzer agent
+│   │   ├── workflows/analyze_harmony.py  # LangGraph graph
+│   │   └── skills/harmony_theory.md      # theory knowledge base for the LLM
+│   ├── scripts/analyze_midi_file.py      # offline harness
+│   ├── tests/                  # unit tests + synthetic MIDI fixtures (tests/midi/)
+│   └── test_*.py               # manual diagnostics (Producer Pal, Anthropic API, live agent)
+├── shared/                     # placeholder package (empty)
+└── docs/
+    ├── VISION.md, ARCHITECTURE.md, AI_AGENTS_GUIDE.md
+    ├── rhythm_analyzer_notes.md
+    ├── producer-pal/           # Producer Pal API reference
+    └── ableton-extensions-sdk/ # local copy of the SDK beta + docs
 ```
 
-## 🚀 Quick Start
+## Running
 
-### Prerequisites
-
-- Python 3.11+
-- [Poetry](https://python-poetry.org/) for dependency management
-- Ableton Live (for integration testing)
-- Producer Pal Max for Live device
-
-### Installation
+Requires Python 3.11+ and Poetry 2.x (use `poetry run` / `poetry env activate`; there is no `poetry shell`).
 
 ```bash
-# Clone repository
-git clone <your-repo-url>
-cd headless-orchestra
+# Tests
+cd agents && poetry run pytest tests/ -v
+cd api-layer && poetry run pytest tests/ -v
 
-# Install dependencies (uses Poetry workspace)
-poetry install
-
-# Run unit tests
-cd api-layer
-poetry run pytest tests/ -v
+# Offline harmony analysis of a .mid file (from agents/)
+poetry run python scripts/analyze_midi_file.py FILE.mid [--track N] [--with-llm] [--json]
 ```
 
-### Integration Test
+`--with-llm` needs `ANTHROPIC_API_KEY`. Live workflows need Ableton with the Producer Pal device running on port 3350.
 
-```bash
-# 1. Start Ableton Live
-# 2. Load Producer Pal Max for Live device
-# 3. Ensure Producer Pal shows "Server running on port 3350"
+## Gotchas
 
-# Run integration test
-cd api-layer
-poetry run python test_integration.py
-```
+- Octaves: Ableton `C3 = 60`, music21 `C4 = 60`. Convert at the boundary.
+- Read note-ons with mido (raw ticks), not `converter.parse`: music21 quantizes off-grid notes
+  and creates phantom duplicates.
+- Ableton exports Drum Rack clips on MIDI channel 0, not GM channel 10. Don't rely on the channel
+  to detect drums. Track names do survive as meta events.
+- `end_of_track` in an exported `.mid` is the last event plus a tail, not the clip length.
 
-## 💻 Usage Example
+## Workflow
 
-```python
-from api_layer.client import ProducerPalClient
-from api_layer.models import Note
+Claude plans and writes specs; Cursor (agent mode) implements. Diagnoses get verified before a
+fix is accepted. Changes are validated on synthetic fixtures with known ground truth.
 
-# Initialize client
-client = ProducerPalClient()
+## Acknowledgments
 
-# Get project information
-project = client.get_project_info()
-print(f"Tempo: {project['tempo']} BPM")
-
-# Get track details
-track = client.get_track(track_id=0)
-print(f"Track name: {track.name}")
-
-# Create MIDI clip with chord
-notes = [
-    Note(pitch="C3", start="1|1", duration="1:0", velocity=80),
-    Note(pitch="E3", start="1|1", duration="1:0", velocity=80),
-    Note(pitch="G3", start="1|1", duration="1:0", velocity=80),
-]
-clip = client.create_midi_clip(track_id=0, notes=notes)
-print(f"Created clip: {clip.name}")
-```
-
-## 🧪 Testing
-
-### Unit Tests
-
-```bash
-cd api-layer
-poetry run pytest tests/ -v           # All tests
-poetry run pytest tests/ -v -k track  # Tests matching "track"
-poetry run pytest tests/ --cov        # With coverage
-```
-
-### Integration Tests
-
-```bash
-cd api-layer
-poetry run python test_integration.py
-```
-
-## 🛠️ Development
-
-### Setup Development Environment
-
-```bash
-# Install all dev dependencies
-poetry install
-
-# Activate virtual environment (Poetry 2.0+)
-poetry run python  # Prefix commands with 'poetry run'
-
-# Or activate manually
-# Windows: <poetry-env-path>\Scripts\Activate.ps1
-# Find path: poetry env info --path
-```
-
-### Code Style
-
-```bash
-# Format code
-poetry run black api-layer/ agents/ shared/
-
-# Type checking
-poetry run mypy api-layer/
-
-# Linting
-poetry run ruff check api-layer/
-```
-
-### Cursor IDE
-
-This project uses Cursor AI IDE with custom rules defined in `.cursor/rules.md`. Key patterns:
-
-- Type hints everywhere (Python 3.11+ syntax)
-- Pydantic for all data models
-- pytest + mocking for tests
-- Google-style docstrings
-
-## 📚 Documentation
-
-- [Architecture Overview](docs/ARCHITECTURE.md) — System design and component interaction
-- [Project Vision](docs/VISION.md) — Goals, motivation, and roadmap
-- [Producer Pal API Reference](docs/producer-pal/api-reference.md) — MCP bridge API documentation
-
-## 🗺️ Roadmap
-
-### Phase 1: Foundation (✅ COMPLETED)
-- [x] Project structure setup
-- [x] API Layer implementation
-- [x] Pydantic models with validation
-- [x] Unit tests with mocking
-- [x] Integration test skeleton
-
-### Phase 2: First AI Agent (In Progress)
-- [ ] HarmonyAnalyzer agent implementation
-- [ ] Claude API integration
-- [ ] Music theory skills (markdown knowledge base)
-- [ ] Agent testing framework
-
-### Phase 3: Multi-Agent System
-- [ ] LangGraph integration
-- [ ] Agent orchestration
-- [ ] State management
-- [ ] Multi-agent workflows
-
-### Phase 4: Advanced Features
-- [ ] Audio analysis capabilities
-- [ ] Real-time MIDI processing
-- [ ] Extended music theory reasoning
-- [ ] Performance optimization
-
-## 🤝 Contributing
-
-This is currently a personal research project. Contribution guidelines will be added once the project matures.
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- [Producer Pal](https://producer-pal.org) by Adam Murray — MCP bridge for Ableton Live
-- [Anthropic](https://anthropic.com) — Claude API and MCP protocol
-- [LangGraph](https://github.com/langchain-ai/langgraph) — Agent orchestration framework
-
-## 📞 Contact
-
-Alexander — Senior Java Backend Developer exploring AI in music production
-
----
-
-**Status:** Phase 1 Complete ✅ | API Layer Ready | Agent Development Starting Soon
+- [Producer Pal](https://producer-pal.org) by Adam Murray: MCP bridge for Ableton Live
+- [music21](https://web.mit.edu/music21/), [mido](https://mido.readthedocs.io/), [LangGraph](https://github.com/langchain-ai/langgraph)
