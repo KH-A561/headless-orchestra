@@ -176,6 +176,8 @@ Traditional: User → AI → DAW Commands → DAW
 Ours:        User → AI + Music Theory → Musical Decisions → DAW
 ```
 
+**Human in the middle.** The person describes what they hear in their own words; the model grounds that description in the computed features, checks its hypothesis by asking, and proposes fixes only for the problem the person has named. Details: [LISTENING_LOOP.md](LISTENING_LOOP.md).
+
 ### 2. Skills-Based Knowledge
 
 Agents augmented with **markdown skills files** containing music theory:

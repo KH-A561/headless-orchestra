@@ -83,6 +83,40 @@ poetry run python scripts/analyze_midi_file.py FILE.mid [--track N] [--with-llm]
 
 `--with-llm` needs `ANTHROPIC_API_KEY`. Live workflows need Ableton with the Producer Pal device running on port 3350.
 
+## MCP server (Claude Desktop)
+
+`agents/agents/mcp_server.py` exposes a read-only MCP server with two tools —
+`find_midi_clips` and `analyze_clip`. It reads clip data from Live through the
+`mcp-server-ableton-live` bridge (Remote Script, TCP `127.0.0.1:9877`) and runs the
+deterministic pipelines locally, so raw notes never pass through the LLM context.
+
+Prerequisites:
+
+1. Install the bridge: `uvx mcp-server-ableton-live@1.8.1 install --replace`.
+2. In Live: Settings → Tempo & MIDI, select the Control Surface `AbletonMCP`
+   (a modal dialog open in Live blocks the bridge).
+3. From `agents/`, get the Python path of the poetry env: `poetry env info --path`.
+
+Then add a server entry to `claude_desktop_config.json` → `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "headless-orchestra": {
+      "command": "<poetry-env-path>/Scripts/python.exe",
+      "args": ["-m", "agents.mcp_server"]
+    }
+  }
+}
+```
+
+On Windows the `<poetry-env-path>` looks like
+`C:\Users\<user>\AppData\Local\pypoetry\Cache\virtualenvs\agents-<hash>-py3.x`.
+
+Alternatively use the installed console script `ho-mcp`
+(`"command": "<poetry-env-path>\Scripts\ho-mcp.exe"`, no `args`). The bridge host and
+port can be overridden with the `ABLETON_HOST` / `ABLETON_PORT` environment variables.
+
 ## Gotchas
 
 - Octaves: Ableton `C3 = 60`, music21 `C4 = 60`. Convert at the boundary.
