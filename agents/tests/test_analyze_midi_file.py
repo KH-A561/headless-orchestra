@@ -9,7 +9,6 @@ from music21 import chord, meter, note, stream
 
 from scripts.analyze_midi_file import load_midi_notes
 
-from agents.chord_grouping import parse_start_to_beats
 from agents.harmony_pipeline import run_deterministic_harmony_analysis
 
 
@@ -69,7 +68,7 @@ class TestAnalyzeMidiFile:
         load_result = load_midi_notes(midi_path)
         assert len(load_result.notes) == 3
         starts = {note_obj.pitch: note_obj.start for note_obj in load_result.notes}
-        pos = parse_start_to_beats(starts["C3"], load_result.beats_per_bar)
+        pos = starts[60]
         assert pos == pytest.approx(1.998, abs=0.02)
 
     def test_jittered_notes_grouped_into_one_chord(self, tmp_path: Path) -> None:

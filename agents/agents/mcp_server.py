@@ -10,19 +10,26 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-from .clip_source import ClipContext, load_clip
+from .adapters.ableton import AbletonAdapter, parse_ref_id
+from .domain import ClipData, WindowedClip, beats_per_bar, windowed
 from .harmony_pipeline import DeterministicHarmonyAnalysis, run_deterministic_harmony_analysis
 from .live_bridge import LiveBridge
-from .rhythm_analyzer import DeterministicRhythmAnalysis, run_deterministic_rhythm_analysis
+from .rhythm_analyzer import (
+    DeterministicRhythmAnalysis,
+    Observation,
+    run_deterministic_rhythm_analysis,
+)
 
 AnalysisKind = Literal["rhythm", "harmony", "both"]
 Region = Literal["loop", "clip"]
 Material = Literal["auto", "percussion", "pitched"]
+PitchNames = Literal["scientific", "ableton"]
 
 _READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
@@ -40,17 +47,66 @@ def _round_floats(value: Any, ndigits: int = 4) -> Any:
     return value
 
 
-def _resolve_material(
-    material: Material,
-    context: ClipContext,
-) -> Literal["auto", "percussion", "pitched"]:
-    """Решить ``material`` для ритма и зафиксировать причину в контексте."""
-    if material != "auto":
-        context.material_reason = "explicit"
-        return material
-    if context.has_drum_rack:
-        return "percussion"
-    return "auto"
+def _pitch_names() -> PitchNames:
+    """Конвенция имён питчей из ``HO_PITCH_NAMES`` (по умолчанию scientific)."""
+    value = os.environ.get("HO_PITCH_NAMES", "scientific")
+    if value in ("scientific", "ableton"):
+        return value  # type: ignore[return-value]
+    return "scientific"
+
+
+def _build_context(
+    clip_data: ClipData,
+    win: WindowedClip,
+    *,
+    track_index: int,
+    clip_index: int,
+    region: Region,
+    bpb: int,
+    material_reason: str,
+) -> dict[str, Any]:
+    """Собрать ``context`` в прежнем формате ответа инструмента."""
+    ts = clip_data.time_signature
+    if region == "loop" and clip_data.window is not None:
+        region_start, region_end = clip_data.window
+    else:
+        region_start, region_end = 0.0, None
+
+    pad_names = clip_data.pad_map or {}
+
+    return {
+        "track_index": track_index,
+        "track_name": clip_data.ref.track_name,
+        "clip_index": clip_index,
+        "clip_name": clip_data.ref.clip_name,
+        "tempo_bpm": clip_data.tempo_bpm,
+        "time_signature": f"{ts.numerator}/{ts.denominator}",
+        "beats_per_bar": bpb,
+        "region": region,
+        "region_start": region_start,
+        "region_end": region_end,
+        "notes_total": win.total,
+        "notes_in_region": win.in_region,
+        "notes_outside_region": win.outside_region,
+        "notes_muted_skipped": win.muted_skipped,
+        "notes_with_probability_below_1": win.probability_below_1,
+        "has_drum_rack": clip_data.pad_map is not None,
+        "pad_names": pad_names,
+        "pitches_without_pad": win.pitches_without_pad,
+        "material_reason": material_reason,
+    }
+
+
+def _compact_observation(obs: Observation) -> dict[str, Any]:
+    """Компактный вид наблюдения: ACCENTS/GHOST_NOTES без полного positions."""
+    dumped = obs.model_dump()
+    if obs.code in ("ACCENTS", "GHOST_NOTES"):
+        positions = dumped["value"].get("positions", [])
+        dumped["value"] = {
+            "count": len(positions),
+            "positions_head": positions[:8],
+        }
+    return dumped
 
 
 def _rhythm_compact(result: DeterministicRhythmAnalysis) -> dict[str, Any]:
@@ -59,7 +115,7 @@ def _rhythm_compact(result: DeterministicRhythmAnalysis) -> dict[str, Any]:
         "routing": result.routing.model_dump(),
         "clip_length_beats": result.clip_length_beats,
         "clip_length_inferred": result.clip_length_inferred,
-        "observations": [obs.model_dump() for obs in result.observations],
+        "observations": [_compact_observation(obs) for obs in result.observations],
         "lanes": [
             {
                 "lane_id": lane.lane_id,
@@ -122,45 +178,25 @@ def _serialize_harmony(result: DeterministicHarmonyAnalysis | None, detail: bool
 def find_midi_clips(query: str = "") -> str:
     """Список MIDI-клипов Session view с фильтром по имени трека или клипа."""
     bridge = LiveBridge()
+    adapter = AbletonAdapter(bridge)
     snapshot = bridge.call("get_session_snapshot")
     tempo = snapshot.get("tempo")
     time_signature = snapshot.get("time_signature", "4/4")
 
-    needle = (query or "").lower()
     clips: list[dict[str, Any]] = []
-
-    for track in snapshot.get("tracks", []):
-        if track.get("type") != "midi":
-            continue
-        if int(track.get("clips", 0)) <= 0:
-            continue
-
-        track_index = int(track["index"])
-        track_name = track.get("name", "")
-        track_info = bridge.call("get_track_info", {"track_index": track_index})
-        has_drum_rack = any(
-            device.get("class_name") == "DrumGroupDevice"
-            for device in track_info.get("devices", [])
+    for summary in adapter.list_clips(query):
+        track_index, clip_index = parse_ref_id(summary.ref.id)
+        clips.append(
+            {
+                "track_index": track_index,
+                "track_name": summary.ref.track_name,
+                "clip_index": clip_index,
+                "clip_name": summary.ref.clip_name,
+                "length": summary.length,
+                "is_playing": summary.is_playing,
+                "has_drum_rack": summary.has_kit,
+            }
         )
-
-        for slot in track_info.get("clip_slots", []):
-            if not slot.get("has_clip"):
-                continue
-            clip = slot.get("clip") or {}
-            clip_name = clip.get("name", "")
-            if needle and needle not in track_name.lower() and needle not in clip_name.lower():
-                continue
-            clips.append(
-                {
-                    "track_index": track_index,
-                    "track_name": track_name,
-                    "clip_index": int(slot.get("index", 0)),
-                    "clip_name": clip_name,
-                    "length": clip.get("length"),
-                    "is_playing": clip.get("is_playing"),
-                    "has_drum_rack": has_drum_rack,
-                }
-            )
 
     response = {"tempo": tempo, "time_signature": time_signature, "clips": clips}
     return json.dumps(_round_floats(response), ensure_ascii=False)
@@ -177,7 +213,17 @@ def analyze_clip(
 ) -> str:
     """Проанализировать клип: ритм и/или гармония поверх посчитанных фактов."""
     bridge = LiveBridge()
-    notes, context, clip_length_beats = load_clip(bridge, track_index, clip_index, region)
+    adapter = AbletonAdapter(bridge)
+    ref_id = f"ableton:t{track_index}/s{clip_index}"
+    clip_data = adapter.read_clip(ref_id)
+    win = windowed(clip_data, region)
+    bpb = beats_per_bar(clip_data.time_signature)
+
+    material_reason = (
+        "explicit"
+        if material != "auto"
+        else ("drum_rack_on_track" if clip_data.pad_map is not None else "heuristic")
+    )
 
     errors: dict[str, str] = {}
     rhythm_result: DeterministicRhythmAnalysis | None = None
@@ -185,13 +231,17 @@ def analyze_clip(
 
     if analysis in ("rhythm", "both"):
         try:
-            resolved_material = _resolve_material(material, context)
+            material_hint: Literal["percussion", "pitched"] | None = (
+                "percussion" if clip_data.pad_map is not None else None
+            )
             rhythm_result = run_deterministic_rhythm_analysis(
-                notes,
-                context.beats_per_bar,
-                clip_length_beats=clip_length_beats,
-                material=resolved_material,
-                lane_names=context.pad_names,
+                win.notes,
+                bpb,
+                clip_length_beats=win.length,
+                material=material,
+                material_hint=material_hint,
+                lane_names=clip_data.pad_map,
+                pitch_names=_pitch_names(),
             )
         except ValueError as error:
             rhythm_result = None
@@ -199,13 +249,21 @@ def analyze_clip(
 
     if analysis in ("harmony", "both"):
         try:
-            harmony_result = run_deterministic_harmony_analysis(notes, context.beats_per_bar)
+            harmony_result = run_deterministic_harmony_analysis(win.notes, bpb)
         except ValueError as error:
             harmony_result = None
             errors["harmony"] = str(error)
 
     response = {
-        "context": context.model_dump(),
+        "context": _build_context(
+            clip_data,
+            win,
+            track_index=track_index,
+            clip_index=clip_index,
+            region=region,
+            bpb=bpb,
+            material_reason=material_reason,
+        ),
         "rhythm": _serialize_rhythm(rhythm_result, detail),
         "harmony": _serialize_harmony(harmony_result, detail),
         "errors": errors,

@@ -4,6 +4,7 @@
 Запуск из каталога agents:
     poetry run python scripts/analyze_midi_file.py FILE.mid [--track N] [--with-llm] [--json]
         [--analysis {harmony,rhythm,both}] [--clip-bars N] [--material ...] [--lane-names PATH]
+        [--pitch-names {scientific,ableton}]
 
 Gotchas:
 - Note-on читаются через mido (сырые тики), НЕ converter.parse — music21 дублирует на сетку.
@@ -22,147 +23,31 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-import mido
-
-from api_layer.models import Note
-
-from agents.chord_grouping import beats_to_start
+from agents.adapters.midi_file import MidiFileAdapter
+from agents.domain import NoteEvent
 from agents.harmony_pipeline import (
     DeterministicHarmonyAnalysis,
     fetch_claude_harmony_reasoning,
     run_deterministic_harmony_analysis,
 )
-from agents.midi_utils import midi_to_ableton_pitch
 from agents.rhythm_analyzer import (
     DeterministicRhythmAnalysis,
     run_deterministic_rhythm_analysis,
 )
-
-# GM drum channel (1-based channel 10 → 0-based index 9).
-_DRUM_CHANNEL = 9
-
-_DEFAULT_DURATION = "1:0"
 
 
 @dataclass(frozen=True)
 class MidiLoadResult:
     """Результат загрузки MIDI-файла."""
 
-    notes: list[Note]
+    notes: list[NoteEvent]
     beats_per_bar: int
     time_signature_str: str
     warnings: list[str]
     tempo_bpm: float | None = None
     track_name: str | None = None
-
-
-def _extract_time_signature_mido(mid: mido.MidiFile) -> tuple[int, str, list[str]]:
-    """Первый time_signature meta по всем трекам."""
-    warnings: list[str] = []
-    beats_per_bar = 4
-    ts_str = "?/4"
-    ts_count = 0
-
-    for track in mid.tracks:
-        for msg in track:
-            if msg.type != "time_signature":
-                continue
-            ts_count += 1
-            if ts_count == 1:
-                beats_per_bar = msg.numerator
-                ts_str = f"{msg.numerator}/{msg.denominator}"
-            elif ts_count == 2:
-                warnings.append(
-                    "Multiple time signatures in file; using first only "
-                    f"({ts_str}). Tempo/size changes are not supported in v1."
-                )
-                return beats_per_bar, ts_str, warnings
-
-    return beats_per_bar, ts_str, warnings
-
-
-def _extract_tempo_and_track_name(
-    mid: mido.MidiFile,
-) -> tuple[float | None, str | None]:
-    """Первое set_tempo (в BPM) и первый непустой track_name по всем трекам."""
-    tempo_bpm: float | None = None
-    track_name: str | None = None
-    for track in mid.tracks:
-        for msg in track:
-            if tempo_bpm is None and msg.type == "set_tempo":
-                tempo_bpm = mido.tempo2bpm(msg.tempo)
-            if track_name is None and msg.type == "track_name" and msg.name:
-                track_name = msg.name
-        if tempo_bpm is not None and track_name is not None:
-            break
-    return tempo_bpm, track_name
-
-
-def _track_has_note_on(track: mido.MidiTrack) -> bool:
-    for msg in track:
-        if msg.type == "note_on" and msg.velocity > 0:
-            return True
-    return False
-
-
-def _iter_track_note_ons(
-    track: mido.MidiTrack,
-    ticks_per_beat: int,
-    *,
-    skip_drum_channel: bool,
-) -> list[tuple[float, int, int, int]]:
-    """Собрать note-on из одного трека; время накапливается внутри трека."""
-    events: list[tuple[float, int, int, int]] = []
-    tick_pos = 0
-    for msg in track:
-        tick_pos += msg.time
-        if msg.type != "note_on" or msg.velocity == 0:
-            continue
-        if skip_drum_channel and msg.channel == _DRUM_CHANNEL:
-            continue
-        offset_quarters = tick_pos / ticks_per_beat
-        events.append((offset_quarters, msg.note, msg.velocity, msg.channel))
-    return events
-
-
-def _load_raw_note_ons_mido(
-    mid: mido.MidiFile,
-    *,
-    track: int | None = None,
-    skip_drum_channel: bool | None = None,
-) -> list[tuple[float, int, int, int]]:
-    """Сырые note-on: (offset_quarters, midi_pitch, velocity, channel)."""
-    ticks_per_beat = mid.ticks_per_beat
-    if skip_drum_channel is None:
-        skip_drum_channel = track is None
-
-    note_track_indices = [i for i, tr in enumerate(mid.tracks) if _track_has_note_on(tr)]
-    if not note_track_indices:
-        return []
-
-    if track is not None:
-        if track < 0 or track >= len(note_track_indices):
-            raise ValueError(
-                f"Track index {track} out of range "
-                f"(file has {len(note_track_indices)} note-bearing track(s))"
-            )
-        selected = [note_track_indices[track]]
-    else:
-        selected = note_track_indices
-
-    events: list[tuple[float, int, int, int]] = []
-    for idx in selected:
-        events.extend(
-            _iter_track_note_ons(
-                mid.tracks[idx],
-                ticks_per_beat,
-                skip_drum_channel=skip_drum_channel,
-            )
-        )
-    events.sort(key=lambda item: item[0])
-    return events
 
 
 def load_midi_notes(
@@ -171,39 +56,26 @@ def load_midi_notes(
     track: int | None = None,
     skip_drum_channel: bool | None = None,
 ) -> MidiLoadResult:
-    """Загрузить MIDI через mido и конвертировать ноты во внутренний формат Note.
+    """Загрузить MIDI через файловый адаптер в нейтральные ``NoteEvent``.
 
     ``skip_drum_channel=None`` сохраняет текущее поведение (ударный канал
     пропускается при слиянии всех партий); ``False`` — ударные не выкидывать.
     """
-    mid = mido.MidiFile(str(path))
-    beats_per_bar, ts_str, warnings = _extract_time_signature_mido(mid)
-    tempo_bpm, track_name = _extract_tempo_and_track_name(mid)
-    raw_events = _load_raw_note_ons_mido(
-        mid, track=track, skip_drum_channel=skip_drum_channel
-    )
+    adapter = MidiFileAdapter(path, track=track, skip_drum_channel=skip_drum_channel)
+    summary = adapter.list_clips()[0]
+    clip = adapter.read_clip(summary.ref.id)
 
-    notes: list[Note] = []
-    for offset, midi, velocity, _channel in raw_events:
-        notes.append(
-            Note(
-                pitch=midi_to_ableton_pitch(midi),
-                start=beats_to_start(offset, beats_per_bar),
-                duration=_DEFAULT_DURATION,
-                velocity=velocity,
-            )
-        )
-
-    if not notes:
+    if not clip.notes:
         raise ValueError(f"No notes found in {path}")
 
+    ts = clip.time_signature
     return MidiLoadResult(
-        notes=notes,
-        beats_per_bar=beats_per_bar,
-        time_signature_str=ts_str,
-        warnings=warnings,
-        tempo_bpm=tempo_bpm,
-        track_name=track_name,
+        notes=list(clip.notes),
+        beats_per_bar=ts.numerator,
+        time_signature_str=f"{ts.numerator}/{ts.denominator}",
+        warnings=adapter.warnings,
+        tempo_bpm=clip.tempo_bpm,
+        track_name=clip.ref.track_name or None,
     )
 
 
@@ -368,6 +240,7 @@ def analyze_midi_file(
     clip_bars: int | None = None,
     material: str = "auto",
     lane_names: dict[int, str] | None = None,
+    pitch_names: Literal["scientific", "ableton"] = "scientific",
 ) -> tuple[DeterministicHarmonyAnalysis | DeterministicRhythmAnalysis, str | None]:
     """Полный прогон: загрузка → анализ (гармония и/или ритм).
 
@@ -431,6 +304,7 @@ def analyze_midi_file(
             clip_length_beats=clip_length_beats,
             material=material,  # type: ignore[arg-type]
             lane_names=lane_names,
+            pitch_names=pitch_names,
         )
         _print_rhythm_report(path, rhythm_load, rhythm_result)
 
@@ -486,6 +360,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Material routing for rhythm analysis (default: auto)",
     )
     parser.add_argument(
+        "--pitch-names",
+        choices=["scientific", "ableton"],
+        default="scientific",
+        help="Pitch name convention for rhythm lanes (default: scientific)",
+    )
+    parser.add_argument(
         "--lane-names",
         type=Path,
         default=None,
@@ -532,6 +412,7 @@ def main(argv: list[str] | None = None) -> None:
             clip_bars=args.clip_bars,
             material=args.material,
             lane_names=lane_names,
+            pitch_names=args.pitch_names,
         )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)

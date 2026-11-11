@@ -59,24 +59,6 @@ typing_extensions = {version = ">=4.5", markers = "python_version < \"3.13\""}
 trio = ["trio (>=0.31.0) ; python_version < \"3.10\"", "trio (>=0.32.0) ; python_version >= \"3.10\""]
 
 [[package]]
-name = "api-layer"
-version = "0.1.0"
-description = "API Layer package"
-optional = false
-python-versions = "^3.11"
-groups = ["main"]
-files = []
-develop = true
-
-[package.dependencies]
-pydantic = "^2.5.0"
-requests = "^2.31.0"
-
-[package.source]
-type = "directory"
-url = "../api-layer"
-
-[[package]]
 name = "attrs"
 version = "26.1.0"
 description = "Classes Without Boilerplate"
@@ -3119,4 +3101,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "fae9516348716089ccdbe1700d3317910a0aeb0d3bef7fe268031b2ff795e610"
+content-hash = "d6fb6318bfd283988c534d3b4d9dabfecd60425af49250da4166f0c5742254f8"

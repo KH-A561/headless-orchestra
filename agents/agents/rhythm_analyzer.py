@@ -14,15 +14,11 @@ import logging
 import math
 import statistics
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 from pydantic import BaseModel
 
-from api_layer.models import Note
-
-from .chord_grouping import parse_start_to_beats
-from .harmony_pipeline import pitch_to_midi
-from .midi_utils import midi_to_ableton_pitch
+from .domain import NoteEvent, pitch_name
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +37,7 @@ ObservationCode = Literal[
 ]
 
 # Онсет: (позиция в долях, MIDI-номер, velocity).
-Onset = tuple[float, int, int]
+Onset = tuple[float, int, float]
 
 
 @dataclass(frozen=True)
@@ -111,8 +107,8 @@ class TimingStats(BaseModel):
 class VelocityStats(BaseModel):
     """Статистика velocity лейна."""
 
-    min: int
-    max: int
+    min: float
+    max: float
     median: float
     mean: float
     std: float
@@ -140,7 +136,7 @@ class RoutingInfo(BaseModel):
     """Решение о типе материала + признаки, на которых оно основано."""
 
     material: Literal["percussion", "pitched"]
-    source: Literal["explicit", "auto"]
+    source: Literal["explicit", "auto", "hint"]
     monophonic_ratio: float
     distinct_pitches: int
     chromatic_neighbor_ratio: float
@@ -164,17 +160,11 @@ def _pstdev(values: list[float]) -> float:
     return statistics.pstdev(values)
 
 
-def _build_onsets(notes: list[Note], beats_per_bar: int) -> list[Onset]:
-    """Ноты → онсеты (позиция, MIDI-номер, velocity); невалидные питчи пропускаются."""
-    onsets: list[Onset] = []
-    for note in notes:
-        try:
-            midi = pitch_to_midi(note.pitch)
-        except ValueError as e:
-            logger.warning("skip invalid pitch %s: %s", note.pitch, e)
-            continue
-        pos = parse_start_to_beats(note.start, beats_per_bar)
-        onsets.append((pos, midi, note.velocity))
+def _build_onsets(notes: Sequence[NoteEvent]) -> list[Onset]:
+    """Ноты → онсеты (позиция, MIDI-номер, velocity)."""
+    onsets: list[Onset] = [
+        (note.start, note.pitch, note.velocity) for note in notes
+    ]
     onsets.sort(key=lambda o: o[0])
     return onsets
 
@@ -235,21 +225,26 @@ def _compute_routing(
     onsets: list[Onset],
     config: RhythmConfig,
     material: Literal["percussion", "pitched", "auto"],
+    material_hint: Literal["percussion", "pitched"] | None,
 ) -> RoutingInfo:
     mono = _monophonic_ratio(onsets, config.simultaneity_tol)
     pitches = sorted({p for _, p, _ in onsets})
     distinct = len(pitches)
     chrom = _chromatic_neighbor_ratio(pitches)
 
-    source: Literal["explicit", "auto"] = "explicit" if material != "auto" else "auto"
-    if material == "auto":
-        resolved: Literal["percussion", "pitched"] = (
+    if material != "auto":
+        source: Literal["explicit", "auto", "hint"] = "explicit"
+        resolved: Literal["percussion", "pitched"] = material
+    elif material_hint is not None:
+        source = "hint"
+        resolved = material_hint
+    else:
+        source = "auto"
+        resolved = (
             "percussion"
             if mono >= config.routing_mono_min and chrom >= config.routing_chrom_min
             else "pitched"
         )
-    else:
-        resolved = material
 
     return RoutingInfo(
         material=resolved,
@@ -356,13 +351,13 @@ def _timing_stats(positions: list[float], config: RhythmConfig) -> TimingStats:
     )
 
 
-def _velocity_stats(velocities: list[int]) -> VelocityStats:
+def _velocity_stats(velocities: list[float]) -> VelocityStats:
     return VelocityStats(
         min=min(velocities),
         max=max(velocities),
         median=statistics.median(velocities),
         mean=statistics.mean(velocities),
-        std=_pstdev([float(v) for v in velocities]),
+        std=_pstdev(velocities),
     )
 
 
@@ -627,25 +622,28 @@ def _clip_observations(
 
 
 def run_deterministic_rhythm_analysis(
-    notes: list[Note],
+    notes: Sequence[NoteEvent],
     beats_per_bar: int,
     *,
     clip_length_beats: float | None = None,
     material: Literal["percussion", "pitched", "auto"] = "auto",
+    material_hint: Literal["percussion", "pitched"] | None = None,
     lane_names: dict[int, str] | None = None,
+    pitch_names: Literal["scientific", "ableton"] = "scientific",
     config: RhythmConfig | None = None,
 ) -> DeterministicRhythmAnalysis:
     """Единая точка входа детерминированного ритмического анализа.
 
     Args:
-        notes: те же ``api_layer.models.Note``, что и в гармонии. Позиции
-            переводятся в доли через ``chord_grouping.parse_start_to_beats``,
-            MIDI-номера — через ``harmony_pipeline.pitch_to_midi`` (Ableton, C3=60).
+        notes: ``NoteEvent`` (MIDI pitch int, позиции в четвертях).
         beats_per_bar: долей в такте (compound-размеры — по числителю).
         clip_length_beats: длина клипа в долях; если не задана — выводится из
             последнего онсета с округлением вверх до границы такта.
         material: тип материала; ``auto`` — по эвристике из раздела 3.2.
+        material_hint: подсказка типа материала; при ``material="auto"``
+            резолвится в ``material`` с ``source="hint"``.
         lane_names: человекочитаемые имена лейнов {midi_pitch: label}.
+        pitch_names: конвенция имени питча в ``LaneAnalysis.pitch_name``.
         config: пороги; по умолчанию ``RhythmConfig()``.
 
     Raises:
@@ -656,7 +654,7 @@ def run_deterministic_rhythm_analysis(
 
     config = config or RhythmConfig()
 
-    onsets = _build_onsets(notes, beats_per_bar)
+    onsets = _build_onsets(notes)
     if not onsets:
         raise ValueError("No valid pitches extracted from notes")
 
@@ -664,7 +662,7 @@ def run_deterministic_rhythm_analysis(
         onsets, beats_per_bar, clip_length_beats
     )
 
-    routing = _compute_routing(onsets, config, material)
+    routing = _compute_routing(onsets, config, material, material_hint)
 
     lanes: list[LaneAnalysis] = []
     observations: list[Observation] = []
@@ -683,7 +681,7 @@ def run_deterministic_rhythm_analysis(
                 str(pitch),
                 lane_onsets,
                 pitch,
-                midi_to_ableton_pitch(pitch),
+                pitch_name(pitch, pitch_names),
                 label,
                 beats_per_bar,
                 num_bars,

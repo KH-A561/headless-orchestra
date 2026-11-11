@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import logging
-import re
 import statistics
 from dataclasses import dataclass
+from typing import Sequence
 
-from api_layer.models import Note
-
-logger = logging.getLogger(__name__)
-
-_DEFAULT_BEATS_PER_BAR = 4
+from .domain import NoteEvent
 
 
 @dataclass(frozen=True)
@@ -36,32 +31,8 @@ class ChordEvent:
 
     raw_pos: float
     nominal_pos: float
-    notes: list[Note]
+    notes: list[NoteEvent]
     is_possible_anticipation: bool
-
-
-# TODO: compound meters (6/8, 12/8) currently use the numerator (6, 12);
-# musically correct beat count (dotted beat grouping) is a future task.
-def parse_time_signature(ts: str) -> int:
-    """Parse a time signature string and return beats per bar (numerator)."""
-    if not ts or not ts.strip():
-        logger.warning("Invalid or empty time_signature %r; defaulting to 4/4", ts)
-        return _DEFAULT_BEATS_PER_BAR
-
-    match = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", ts.strip())
-    if not match:
-        logger.warning("Invalid time_signature %r; defaulting to 4/4", ts)
-        return _DEFAULT_BEATS_PER_BAR
-
-    return int(match[1])
-
-
-def parse_start_to_beats(start: str, beats_per_bar: int) -> float:
-    """Convert ``bar|beat`` start string to absolute position in beats from clip start."""
-    bar_str, beat_str = start.split("|")
-    bar = float(bar_str)
-    beat = float(beat_str)
-    return (bar - 1) * beats_per_bar + (beat - 1)
 
 
 def beats_to_start(pos: float, beats_per_bar: int) -> str:
@@ -123,7 +94,10 @@ def _is_possible_anticipation(raw_pos: float, config: ChordGroupingConfig) -> bo
     return (next_strong - raw_pos) <= config.anticipation_window
 
 
-def _finalize_group(notes_with_pos: list[tuple[Note, float]], config: ChordGroupingConfig) -> ChordEvent:
+def _finalize_group(
+    notes_with_pos: list[tuple[NoteEvent, float]],
+    config: ChordGroupingConfig,
+) -> ChordEvent:
     positions = [pos for _, pos in notes_with_pos]
     raw_pos = statistics.median(positions)
     nominal_pos = _snap_to_grid(raw_pos, config.grid_step)
@@ -135,7 +109,10 @@ def _finalize_group(notes_with_pos: list[tuple[Note, float]], config: ChordGroup
     )
 
 
-def group_notes_into_chords(notes: list[Note], config: ChordGroupingConfig | None = None) -> list[ChordEvent]:
+def group_notes_into_chords(
+    notes: Sequence[NoteEvent],
+    config: ChordGroupingConfig | None = None,
+) -> list[ChordEvent]:
     """Group notes into chord events using numeric time tolerance."""
     if config is None:
         config = ChordGroupingConfig()
@@ -143,13 +120,10 @@ def group_notes_into_chords(notes: list[Note], config: ChordGroupingConfig | Non
     if not notes:
         return []
 
-    notes_with_pos = [
-        (note, parse_start_to_beats(note.start, config.beats_per_bar))
-        for note in notes
-    ]
+    notes_with_pos = [(note, note.start) for note in notes]
     notes_with_pos.sort(key=lambda item: item[1])
 
-    groups: list[list[tuple[Note, float]]] = [[notes_with_pos[0]]]
+    groups: list[list[tuple[NoteEvent, float]]] = [[notes_with_pos[0]]]
 
     for note, pos in notes_with_pos[1:]:
         current = groups[-1]

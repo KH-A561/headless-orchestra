@@ -16,72 +16,76 @@ See [docs/VISION.md](docs/VISION.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTUR
 
 | Component | State |
 |---|---|
-| `api-layer` — Producer Pal client (MCP over HTTP :3350), Pydantic models | ✅ unit-tested with mocks; ⚠️ live Ableton integration not verified |
+| Neutral core (`agents/agents/domain.py`) + adapters (Ableton Live, MIDI file) | ✅ |
 | Chord grouping — tolerant onset clustering, time-signature aware, anticipation flag | ✅ |
 | Functional harmony Level 2 (slices A+B) — Krumhansl-Schmuckler key, roman numerals, T-S-D, `detect_tonal_mode` gating, incomplete chords | ✅ |
 | Shared pipeline `run_deterministic_harmony_analysis` — used by the LangGraph workflow and the offline harness | ✅ |
-| RhythmAnalyzer | 📝 design only — [docs/rhythm_analyzer_notes.md](docs/rhythm_analyzer_notes.md) |
+| RhythmAnalyzer | ✅ |
 | Harmony slice C (cadences, local key, secondary dominants, borrowed chords) | ⏳ planned |
 | TimbreAnalyzer, swappable reasoning provider | ⏳ planned |
 
-Open decision: stay on Producer Pal or move to the Ableton Extensions SDK
-(beta, local copy in `docs/ableton-extensions-sdk/`).
+The `api-layer/` package (Producer Pal client) is frozen and not part of the working path.
 
 ## Architecture
 
 ```
-LangGraph workflow (agents/agents/workflows/analyze_harmony.py)
-  fetch_clip → load_skill → deterministic_analysis → analyze_with_claude → format_result
-        │                          │
-        │                          └─ harmony_pipeline.py  (chord_grouping + functional_labeling)
+adapters (Ableton Live / .mid)
+        │
         ▼
-api-layer: ProducerPalClient ──HTTP/MCP──► Producer Pal (Max for Live, :3350) ──► Ableton Live
+harmony_pipeline.py  (chord_grouping + functional_labeling)
+        │
+        └─ run_deterministic_harmony_analysis  ← shared by MCP server and offline harness
 ```
 
-The offline harness (`agents/scripts/analyze_midi_file.py`) runs the same deterministic pipeline
-on a `.mid` file without Ableton.
+The core (`agents/agents/domain.py`) owns a neutral `NoteEvent` model; DAW-specific
+conventions live inside the adapters. The offline harness (`agents/scripts/analyze_midi_file.py`)
+runs the same deterministic pipeline on a `.mid` file without Ableton.
 
 ## Project structure
 
 ```
 headless-orchestra/
-├── api-layer/                  # Producer Pal client
-│   ├── api_layer/client.py     # ProducerPalClient
-│   ├── api_layer/models.py     # Pydantic models (Note, Clip, Track)
-│   └── tests/                  # pytest, mocked HTTP
+├── api-layer/                  # frozen (Producer Pal client, not used)
 ├── agents/
 │   ├── agents/
+│   │   ├── domain.py               # neutral core model + windowed()/pitch_name()
+│   │   ├── adapters/
+│   │   │   ├── ableton.py          # Ableton Live adapter (all DAW specifics)
+│   │   │   └── midi_file.py        # .mid file adapter (mido, raw ticks)
 │   │   ├── chord_grouping.py       # onset clustering, anticipation
 │   │   ├── functional_labeling.py  # key, roman numerals, T-S-D, tonal mode
 │   │   ├── harmony_pipeline.py     # deterministic pipeline + Claude reasoning call
-│   │   ├── harmony_analyzer.py     # HarmonyAnalyzer agent
-│   │   ├── workflows/analyze_harmony.py  # LangGraph graph
+│   │   ├── live_bridge.py          # read-only bridge client (mcp-server-ableton-live)
+│   │   ├── mcp_server.py           # MCP tools find_midi_clips / analyze_clip
+│   │   ├── rhythm_analyzer.py      # deterministic rhythm analysis
 │   │   └── skills/harmony_theory.md      # theory knowledge base for the LLM
 │   ├── scripts/analyze_midi_file.py      # offline harness
-│   ├── tests/                  # unit tests + synthetic MIDI fixtures (tests/midi/)
-│   └── test_*.py               # manual diagnostics (Producer Pal, Anthropic API, live agent)
-├── shared/                     # placeholder package (empty)
+│   └── tests/                  # unit tests + synthetic MIDI fixtures (tests/midi/)
 └── docs/
     ├── VISION.md, ARCHITECTURE.md, AI_AGENTS_GUIDE.md
     ├── rhythm_analyzer_notes.md
+    ├── specs/                  # implementation specs
     ├── producer-pal/           # Producer Pal API reference
     └── ableton-extensions-sdk/ # local copy of the SDK beta + docs
 ```
 
 ## Running
 
-Requires Python 3.11+ and Poetry 2.x (use `poetry run` / `poetry env activate`; there is no `poetry shell`).
+Requires Python 3.11+ and Poetry 2.x (use `poetry run`; there is no `poetry shell`).
 
 ```bash
+# Install (from agents/)
+cd agents && poetry install
+
 # Tests
-cd agents && poetry run pytest tests/ -v
-cd api-layer && poetry run pytest tests/ -v
+poetry run pytest -v
 
 # Offline harmony analysis of a .mid file (from agents/)
 poetry run python scripts/analyze_midi_file.py FILE.mid [--track N] [--with-llm] [--json]
 ```
 
-`--with-llm` needs `ANTHROPIC_API_KEY`. Live workflows need Ableton with the Producer Pal device running on port 3350.
+`--with-llm` needs `ANTHROPIC_API_KEY`. Live workflows need Ableton with the
+`mcp-server-ableton-live` bridge running on TCP 127.0.0.1:9877.
 
 ## MCP server (Claude Desktop)
 
@@ -133,5 +137,5 @@ fix is accepted. Changes are validated on synthetic fixtures with known ground t
 
 ## Acknowledgments
 
-- [Producer Pal](https://producer-pal.org) by Adam Murray: MCP bridge for Ableton Live
+- [mcp-server-ableton-live](https://github.com/Simon-Kansara/mcp-server-ableton-live): bridge to Ableton Live
 - [music21](https://web.mit.edu/music21/), [mido](https://mido.readthedocs.io/), [LangGraph](https://github.com/langchain-ai/langgraph)

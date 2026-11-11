@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from agents.mcp_server import analyze_clip, find_midi_clips
+from agents.domain import NoteEvent
+from agents.mcp_server import _rhythm_compact, analyze_clip, find_midi_clips
+from agents.rhythm_analyzer import run_deterministic_rhythm_analysis
 
 
 def _patch_bridge(
@@ -214,3 +216,30 @@ class TestAnalyzeClip:
         assert data["harmony"] is None
         assert data["errors"]
         assert data["context"]["notes_total"] == 0
+
+    def test_no_kit_material_reason_heuristic(self, monkeypatch) -> None:
+        responses = _fixture_b()
+        responses["get_track_info"]["devices"] = []
+        _patch_bridge(monkeypatch, lambda cmd, params: responses[cmd])
+
+        data = json.loads(analyze_clip(0, 0))
+
+        assert data["context"]["material_reason"] == "heuristic"
+        assert data["context"]["has_drum_rack"] is False
+
+
+class TestCompactObservations:
+    def test_accents_compact_count_and_head(self) -> None:
+        notes = [
+            NoteEvent(pitch=36, start=float(i), duration=1.0, velocity=v)
+            for i, v in enumerate([10] * 10 + [100] * 9)
+        ]
+        result = run_deterministic_rhythm_analysis(notes, 4)
+        compact = _rhythm_compact(result)
+
+        accents = [o for o in compact["observations"] if o["code"] == "ACCENTS"]
+        assert len(accents) == 1
+        value = accents[0]["value"]
+        assert "positions" not in value
+        assert value["count"] == 9
+        assert len(value["positions_head"]) == 8

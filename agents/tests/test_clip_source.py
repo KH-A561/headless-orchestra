@@ -1,4 +1,4 @@
-"""Тесты clip_source: окно анализа, конвертация в Note, пэды и material."""
+"""Тесты адаптера Ableton + windowed(): окно анализа, пэды и material."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ from typing import Any
 
 import pytest
 
-from agents.clip_source import load_clip
+from agents.adapters.ableton import AbletonAdapter, parse_ref_id
+from agents.domain import windowed
 from agents.live_bridge import LiveBridge
 from agents.rhythm_analyzer import run_deterministic_rhythm_analysis
 
@@ -159,41 +160,42 @@ class TestFixtureA:
         _point_env(fake_bridge, monkeypatch)
         fake_bridge.responses = _fixture_a()
 
-        notes, context, clip_length = load_clip(LiveBridge(), 0, 0, region="loop")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
+        win = windowed(clip, "loop")
 
-        assert context.notes_total == 9
-        assert context.notes_in_region == 5
-        assert context.notes_outside_region == 4
-        assert context.notes_muted_skipped == 0
-        assert context.has_drum_rack is True
-        assert context.material_reason == "drum_rack_on_track"
-        assert context.pad_names[36] == "DBL BASS B-1"
-        assert context.region_start == 0.0
-        assert context.region_end == 4.0
-        assert len(notes) == 5
-        assert notes[0].start == "1|1"
-        assert notes[0].pitch == "C1"  # MIDI 36 → Ableton C1
-        assert clip_length == 4.0
+        assert win.total == 9
+        assert win.in_region == 5
+        assert win.outside_region == 4
+        assert win.muted_skipped == 0
+        assert clip.pad_map is not None
+        assert clip.pad_map[36] == "DBL BASS B-1"
+        assert clip.window == (0.0, 4.0)
+        assert len(win.notes) == 5
+        assert win.notes[0].start == 0.0
+        assert win.notes[0].pitch == 36  # MIDI 36
+        assert win.length == 4.0
 
     def test_clip_window(self, fake_bridge, monkeypatch) -> None:
         _point_env(fake_bridge, monkeypatch)
         fake_bridge.responses = _fixture_a()
 
-        notes, context, clip_length = load_clip(LiveBridge(), 0, 0, region="clip")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
+        win = windowed(clip, "clip")
 
-        assert context.notes_in_region == 9
-        assert context.notes_outside_region == 0
-        assert context.region_end is None
-        assert clip_length is None
-        assert len(notes) == 9
+        assert win.in_region == 9
+        assert win.outside_region == 0
+        assert win.length is None
+        assert len(win.notes) == 9
 
         # Длина клипа выводится по последней ноте: 2 такта по 4 доли.
         rhythm = run_deterministic_rhythm_analysis(
-            notes,
-            context.beats_per_bar,
+            win.notes,
+            clip.time_signature.beats_per_bar,
             clip_length_beats=None,
             material="percussion",
-            lane_names=context.pad_names,
+            lane_names=clip.pad_map,
         )
         assert rhythm.clip_length_inferred is True
         assert rhythm.clip_length_beats == 8.0
@@ -204,23 +206,27 @@ class TestFixtureB:
         _point_env(fake_bridge, monkeypatch)
         fake_bridge.responses = _fixture_b()
 
-        notes, context, clip_length = load_clip(LiveBridge(), 0, 0, region="loop")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
+        win = windowed(clip, "loop")
 
-        assert context.notes_in_region == 7
-        assert context.notes_outside_region == 4
-        assert context.notes_with_probability_below_1 == 2
-        assert context.pitches_without_pad == []
-        assert notes[0].start == "1|1"  # сдвиг сработал
-        assert notes[0].velocity == 104  # round(104.140625)
-        assert clip_length == pytest.approx(2.4240, abs=1e-4)
+        assert win.in_region == 7
+        assert win.outside_region == 4
+        assert win.probability_below_1 == 2
+        assert win.pitches_without_pad == []
+        assert win.notes[0].start == 0.0  # сдвиг сработал
+        assert win.notes[0].velocity == 104.140625  # float, без округления
+        assert win.length == pytest.approx(2.4240, abs=1e-4)
 
     def test_clip_window_pitches_without_pad(self, fake_bridge, monkeypatch) -> None:
         _point_env(fake_bridge, monkeypatch)
         fake_bridge.responses = _fixture_b()
 
-        _, context, _ = load_clip(LiveBridge(), 0, 0, region="clip")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
+        win = windowed(clip, "clip")
 
-        assert context.pitches_without_pad == [40]
+        assert win.pitches_without_pad == [40]
 
 
 class TestMutedNotes:
@@ -228,12 +234,14 @@ class TestMutedNotes:
         _point_env(fake_bridge, monkeypatch)
         fake_bridge.responses = _fixture_a(extra_notes=[_note(36, 1.0, mute=True)])
 
-        notes, context, _ = load_clip(LiveBridge(), 0, 0, region="loop")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
+        win = windowed(clip, "loop")
 
-        assert context.notes_total == 10
-        assert context.notes_muted_skipped == 1
-        assert context.notes_in_region == 5
-        assert len(notes) == 5
+        assert win.total == 10
+        assert win.muted_skipped == 1
+        assert win.in_region == 5
+        assert len(win.notes) == 5
 
 
 class TestNoDrumRack:
@@ -246,29 +254,26 @@ class TestNoDrumRack:
         responses["get_session_snapshot"]["tracks"][0]["name"] = "Keys"
         fake_bridge.responses = responses
 
-        _, context, _ = load_clip(LiveBridge(), 0, 0, region="loop")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
+        win = windowed(clip, "loop")
 
-        assert context.has_drum_rack is False
-        assert context.pad_names == {}
-        assert context.material_reason == "heuristic"
+        assert clip.pad_map is None
+        assert win.pitches_without_pad == []  # pad_map=None → []
 
         commands = [record["type"] for record in fake_bridge.recorded]
         assert "get_drum_pads" not in commands
 
-    def test_pitches_without_pad_empty_without_drum_rack(
-        self, fake_bridge, monkeypatch
-    ) -> None:
-        _point_env(fake_bridge, monkeypatch)
-        responses = _fixture_a()
-        responses["get_track_info"]["devices"] = [
-            {"index": 0, "name": "Simpler", "class_name": "Instrument"}
-        ]
-        fake_bridge.responses = responses
 
-        _, context, _ = load_clip(LiveBridge(), 0, 0, region="loop")
+class TestParseRefId:
+    def test_valid(self) -> None:
+        assert parse_ref_id("ableton:t7/s8") == (7, 8)
 
-        assert context.has_drum_rack is False
-        assert context.pitches_without_pad == []
+    def test_garbage(self) -> None:
+        with pytest.raises(ValueError):
+            parse_ref_id("file:foo#all")
+        with pytest.raises(ValueError):
+            parse_ref_id("ableton:xyz")
 
 
 class TestTrackName:
@@ -277,14 +282,20 @@ class TestTrackName:
     ) -> None:
         _point_env(fake_bridge, monkeypatch)
         responses = _fixture_a()
-        # Порядок треков в снапшоте не совпадает с индексом: по индексу 0 — другой трек.
+        # Порядок/индексы в снапшоте не совпадают с track_index клипа.
         responses["get_session_snapshot"]["tracks"] = [
-            {"index": 0, "name": "Other Track", "type": "midi", "clips": 1, "devices": []},
-            {"index": 1, "name": "8-Drum Rack 1", "type": "midi", "clips": 1, "devices": []},
+            {"index": 5, "name": "Wrong Order", "type": "midi", "clips": 1, "devices": []}
         ]
-        responses["get_track_info"]["name"] = "8-Drum Rack 1"
+        responses["get_track_info"] = {
+            "name": "Real Track Name",
+            "clip_slots": [
+                {"index": 0, "has_clip": True, "clip": {"name": "Clip", "length": 4.0}}
+            ],
+            "devices": [],
+        }
         fake_bridge.responses = responses
 
-        _, context, _ = load_clip(LiveBridge(), 0, 0, region="loop")
+        adapter = AbletonAdapter(LiveBridge())
+        clip = adapter.read_clip("ableton:t0/s0")
 
-        assert context.track_name == "8-Drum Rack 1"
+        assert clip.ref.track_name == "Real Track Name"

@@ -1,4 +1,4 @@
-"""Общие фикстуры для тестов live_bridge / clip_source / mcp_server."""
+"""Общие фикстуры для тестов live_bridge / ableton adapter / mcp_server."""
 
 from __future__ import annotations
 

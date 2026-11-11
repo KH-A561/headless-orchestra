@@ -11,7 +11,6 @@ from pathlib import Path
 
 import mido
 import pytest
-from api_layer.models import Note
 
 from scripts.analyze_midi_file import (
     _load_lane_names,
@@ -20,7 +19,7 @@ from scripts.analyze_midi_file import (
     main,
 )
 
-from agents.chord_grouping import beats_to_start
+from agents.domain import NoteEvent
 from agents.rhythm_analyzer import (
     DeterministicRhythmAnalysis,
     run_deterministic_rhythm_analysis,
@@ -29,13 +28,8 @@ from agents.rhythm_analyzer import (
 _FIXTURES_DIR = Path(__file__).parent / "midi"
 
 
-def _note(pitch: str, pos: float, velocity: int = 100, bpb: int = 4) -> Note:
-    return Note(
-        pitch=pitch,
-        start=beats_to_start(pos, bpb),
-        duration="1:0",
-        velocity=velocity,
-    )
+def _note(pitch: int, pos: float, velocity: float = 100) -> NoteEvent:
+    return NoteEvent(pitch=pitch, start=pos, duration=1.0, velocity=velocity)
 
 
 def _codes(result: DeterministicRhythmAnalysis) -> set[str]:
@@ -50,7 +44,7 @@ def _obs(result: DeterministicRhythmAnalysis, code: str, lane_id: str | None = N
 
 class TestSyntheticCases:
     def test_even_16ths_uniform_velocity(self) -> None:
-        notes = [_note("C3", i * 0.25) for i in range(16)]
+        notes = [_note(60, i * 0.25) for i in range(16)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         codes = _codes(result)
         assert "UNIFORM_VELOCITY" in codes
@@ -59,7 +53,7 @@ class TestSyntheticCases:
         assert "SWING_8TH" not in codes
 
     def test_clap_every_3_beats_cycle(self) -> None:
-        notes = [_note("C3", p) for p in (0.0, 3.0, 6.0, 9.0)]
+        notes = [_note(60, p) for p in (0.0, 3.0, 6.0, 9.0)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         cycles = _obs(result, "CYCLE")
         assert len(cycles) == 1
@@ -68,7 +62,7 @@ class TestSyntheticCases:
         assert cycles[0].value["aligns_with_bar"] is False
 
     def test_backbeat_cycle_aligned(self) -> None:
-        notes = [_note("C3", p) for p in (1.0, 3.0, 5.0, 7.0)]
+        notes = [_note(60, p) for p in (1.0, 3.0, 5.0, 7.0)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         cycles = _obs(result, "CYCLE")
         assert len(cycles) == 1
@@ -78,7 +72,7 @@ class TestSyntheticCases:
 
     def test_swing_06_no_unquantized_no_loose(self) -> None:
         positions = [b + off for b in (0.0, 1.0, 2.0, 3.0) for off in (0.0, 0.6)]
-        notes = [_note("C3", p) for p in positions]
+        notes = [_note(60, p) for p in positions]
         result = run_deterministic_rhythm_analysis(notes, 4)
         swing = _obs(result, "SWING_8TH")
         assert len(swing) == 1
@@ -89,7 +83,7 @@ class TestSyntheticCases:
 
     def test_swing_triplet_feel_text(self) -> None:
         positions = [b + off for b in (0.0, 1.0, 2.0, 3.0) for off in (0.0, 0.6667)]
-        notes = [_note("C3", p) for p in positions]
+        notes = [_note(60, p) for p in positions]
         result = run_deterministic_rhythm_analysis(notes, 4)
         swing = _obs(result, "SWING_8TH")
         assert len(swing) == 1
@@ -97,14 +91,14 @@ class TestSyntheticCases:
         assert "UNQUANTIZED" not in _codes(result)
 
     def test_laid_back_no_loose(self) -> None:
-        notes = [_note("C3", p) for p in (0.03, 1.03, 2.03, 3.03)]
+        notes = [_note(60, p) for p in (0.03, 1.03, 2.03, 3.03)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         codes = _codes(result)
         assert "LAID_BACK" in codes
         assert "LOOSE" not in codes
 
     def test_pushed_no_loose(self) -> None:
-        notes = [_note("C3", p) for p in (0.97, 1.97, 2.97, 3.97)]
+        notes = [_note(60, p) for p in (0.97, 1.97, 2.97, 3.97)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         codes = _codes(result)
         assert "PUSHED" in codes
@@ -114,7 +108,7 @@ class TestSyntheticCases:
     def test_deterministic_jitter_loose(self) -> None:
         base = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75]
         jitter = [0.05, -0.05, 0.05, -0.05, 0.05, -0.05, 0.05, -0.05]
-        notes = [_note("C3", b + j) for b, j in zip(base, jitter)]
+        notes = [_note(60, b + j) for b, j in zip(base, jitter)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         codes = _codes(result)
         assert "LOOSE" in codes
@@ -123,7 +117,7 @@ class TestSyntheticCases:
 
     def test_between_16ths_unquantized(self) -> None:
         positions = [b + off for b in (0.0, 1.0) for off in (0.125, 0.375, 0.625, 0.875)]
-        notes = [_note("C3", p) for p in positions]
+        notes = [_note(60, p) for p in positions]
         result = run_deterministic_rhythm_analysis(notes, 4)
         codes = _codes(result)
         assert "UNQUANTIZED" in codes
@@ -134,7 +128,7 @@ class TestSyntheticCases:
     def test_accents_and_ghost_notes(self) -> None:
         velocities = [50, 100, 100, 100, 127]
         positions = [0.0, 0.5, 1.0, 1.5, 2.0]
-        notes = [_note("C3", p, v) for p, v in zip(positions, velocities)]
+        notes = [_note(60, p, v) for p, v in zip(positions, velocities)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         accents = _obs(result, "ACCENTS")
         ghosts = _obs(result, "GHOST_NOTES")
@@ -144,7 +138,7 @@ class TestSyntheticCases:
         assert ghosts[0].value["positions"] == [0.0]
 
     def test_empty_bar_mid_clip(self) -> None:
-        notes = [_note("C3", p) for p in (0.0, 1.0, 8.0, 9.0)]
+        notes = [_note(60, p) for p in (0.0, 1.0, 8.0, 9.0)]
         result = run_deterministic_rhythm_analysis(notes, 4, clip_length_beats=12)
         empty = _obs(result, "EMPTY_BARS")
         assert len(empty) == 1
@@ -152,7 +146,7 @@ class TestSyntheticCases:
         assert not _obs(result, "TRAILING_EMPTY")
 
     def test_trailing_empty_with_given_length(self) -> None:
-        notes = [_note("C3", p) for p in (0.0, 1.0)]
+        notes = [_note(60, p) for p in (0.0, 1.0)]
         result = run_deterministic_rhythm_analysis(notes, 4, clip_length_beats=8)
         trailing = _obs(result, "TRAILING_EMPTY")
         assert len(trailing) == 1
@@ -160,13 +154,13 @@ class TestSyntheticCases:
         assert not _obs(result, "EMPTY_BARS")
 
     def test_trailing_empty_suppressed_when_inferred(self) -> None:
-        notes = [_note("C3", p) for p in (0.0, 1.0)]
+        notes = [_note(60, p) for p in (0.0, 1.0)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         assert result.clip_length_inferred is True
         assert not _obs(result, "TRAILING_EMPTY")
 
     def test_clip_length_not_multiple_uses_ceil_bars(self) -> None:
-        notes = [_note("C3", 12.5)]
+        notes = [_note(60, 12.5)]
         result = run_deterministic_rhythm_analysis(notes, 4, clip_length_beats=13)
         hits = result.lanes[0].hits_per_bar
         assert len(hits) == 4
@@ -174,14 +168,14 @@ class TestSyntheticCases:
         assert hits[0:3] == [0, 0, 0]
 
     def test_chords_auto_pitched_single_lane(self) -> None:
-        notes = [_note(p, pos) for pos in (0.0, 1.0, 2.0) for p in ("C3", "E3", "G3")]
+        notes = [_note(p, pos) for pos in (0.0, 1.0, 2.0) for p in (60, 64, 67)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         assert result.routing.material == "pitched"
         assert len(result.lanes) == 1
         assert result.lanes[0].lane_id == "all"
 
     def test_below_thresholds_stats_but_no_observations(self) -> None:
-        notes = [_note("C3", p) for p in (0.0, 1.0, 2.0)]
+        notes = [_note(60, p) for p in (0.0, 1.0, 2.0)]
         result = run_deterministic_rhythm_analysis(notes, 4)
         lane = result.lanes[0]
         assert lane.count == 3
@@ -204,8 +198,24 @@ class TestSyntheticCases:
         with pytest.raises(ValueError):
             run_deterministic_rhythm_analysis([], 4)
 
+    def test_material_hint_routes_with_source_hint(self) -> None:
+        notes = [_note(36, p) for p in (0.0, 2.0, 4.0, 6.0)]
+        result = run_deterministic_rhythm_analysis(
+            notes, 4, material="auto", material_hint="percussion"
+        )
+        assert result.routing.material == "percussion"
+        assert result.routing.source == "hint"
+
+    def test_material_hint_ignored_when_explicit(self) -> None:
+        notes = [_note(36, p) for p in (0.0, 2.0, 4.0, 6.0)]
+        result = run_deterministic_rhythm_analysis(
+            notes, 4, material="pitched", material_hint="percussion"
+        )
+        assert result.routing.material == "pitched"
+        assert result.routing.source == "explicit"
+
     def test_lane_names_labels(self) -> None:
-        notes = [_note("C1", p) for p in (0.0, 2.0, 4.0, 6.0)]
+        notes = [_note(36, p) for p in (0.0, 2.0, 4.0, 6.0)]
         result = run_deterministic_rhythm_analysis(
             notes,
             4,
@@ -214,7 +224,7 @@ class TestSyntheticCases:
         )
         lane = next(l for l in result.lanes if l.lane_id == "36")
         assert lane.label == "bass chop"
-        assert lane.pitch_name == "C1"
+        assert lane.pitch_name == "C2"
 
 
 class TestRealClipTwinPeaks:
